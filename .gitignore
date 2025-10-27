@@ -1,0 +1,22 @@
+# IDE 配置
+.idea/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*.class
+
+# 数据文件和结果（通常不提交到git，特别是大文件）
+data/
+results/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+*.temp
