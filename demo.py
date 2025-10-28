@@ -14,7 +14,8 @@ import os
 import json
 import pandas as pd
 from datetime import datetime
-
+import subprocess
+import json
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
@@ -32,11 +33,20 @@ parser.add_argument('--gamma', type=float, default=0.9, help='gamma')
 parser.add_argument('--weight_decay', type=float, default=0, help='weight_decay')
 args = parser.parse_args()
 
+def get_git_branch_name():
+    """获取当前 Git 分支名"""
+    try:
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
+    except Exception:
+        branch = "unknown_branch"
+        print("⚠️ 未检测到 Git 分支信息，结果将保存在 unknown_branch 目录中。")
+    return branch
 
 # 🆕 创建实验结果目录
 def create_experiment_dir(dataset_name):
     """创建实验目录结构"""
-    base_dir = f'./results/{dataset_name}'
+    branch_name = get_git_branch_name()  # 获取当前 Git 分支名
+    base_dir = f'./results/{branch_name}/{dataset_name}'  # ← 多一层分支目录
     os.makedirs(base_dir, exist_ok=True)
     return base_dir
 
@@ -212,21 +222,31 @@ def valid_epoch(model, valid_loader, criterion, optimizer, device):
 
 # 测试阶段，仅进行前向传播获取预测结果；支持分块推理处理大尺寸数据
 def test_epoch(model, test_loader, device):
-    pre = np.array([])
+    pre = []  # 存放预测结果
+    tar = []  # 存放真实标签
+
     for batch_idx, (batch_data, batch_target) in enumerate(test_loader):
         batch_data = batch_data.to(device)
         batch_target = batch_target.to(device)
 
+        # 模型前向传播
         if args.model_name == 's2vnet':
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, _, _ = model(batch_data)
         else:
             batch_pred = model(batch_data)
 
+        # 获取预测类别
         _, pred = batch_pred.topk(1, 1, True, True)
         pp = pred.squeeze()
-        pre = np.append(pre, pp.data.cpu().numpy())
 
-    return pre
+        # 收集结果
+        pre.extend(pp.detach().cpu().numpy().tolist())
+        tar.extend(batch_target.detach().cpu().numpy().tolist())
+
+    pre = np.array(pre)
+    tar = np.array(tar)
+
+    return pre, tar
 
 
 def main():
@@ -283,10 +303,18 @@ def main():
         model.eval()
 
         # ✅ 自动选择模型权重路径（根据当前数据集）
-        weight_path = f'./results/{args.dataset}_s2vnet_p{args.patches}_best.pkl'
+        branch_name = get_git_branch_name()
+        weight_dir = f'./results/{branch_name}/{args.dataset}'
+        # 查找最新或最优模型
+        weight_files = [f for f in os.listdir(weight_dir) if f.endswith('.pkl')]
+        if not weight_files:
+            raise FileNotFoundError(f"❌ 没有在 {weight_dir} 中找到权重文件。")
+        weight_files.sort(key=lambda x: os.path.getmtime(os.path.join(weight_dir, x)), reverse=True)
+        weight_path = os.path.join(weight_dir, weight_files[0])
+        print(f"✅ 自动加载最新权重: {weight_path}")
         if not os.path.exists(weight_path):
             # 若找不到best模型，可改成你之前保存的具体文件名
-            weight_path = './results/Berlin/Berlin_s2vnet_p7_78.53_epoch320.pkl'
+            weight_path = './results/master/Indian/Indian_s2vnet_p7_97.53_epoch440_2025-10-28-2043.pkl'
         print(f"Loading weights from: {weight_path}")
         model.load_state_dict(torch.load(weight_path, map_location=device))
 
@@ -338,10 +366,7 @@ def main():
         else:
             print("✅ 未检测到内存映射文件，使用 DataLoader 直接推理...")
             with torch.no_grad():
-                pre_u = test_epoch(model, label_true_loader, device)
-            for _, targets in label_true_loader:
-                tar_t.extend(targets.numpy())
-            tar_t = np.array(tar_t)
+                pre_u, tar_t = test_epoch(model, label_true_loader, device)
 
         # ✅ 构造预测矩阵并保存
         prediction_matrix = np.zeros((height, width), dtype=float)
@@ -367,10 +392,25 @@ def main():
         print("AA for each class:", AA2)
         print("**************************************************")
 
-        # 🚀 更新：结果文件也包含数据集名称
-        results_path = os.path.join(experiment_dir, f'{args.dataset}_test_metrics.npz')
-        np.savez(results_path, OA=OA2, AA_mean=AA_mean2, Kappa=Kappa2, AA=AA2)
-        print(f"📁 测试结果已保存至 {results_path}")
+        # 🚀 生成唯一文件名，防止被覆盖
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_json_path = os.path.join(experiment_dir, f'{args.dataset}_test_metrics_{timestamp}.json')
+
+        # 🚀 将指标打包为字典
+        metrics = {
+            "dataset": args.dataset,
+            "Overall_Accuracy": float(OA2),
+            "Average_Accuracy": float(AA_mean2),
+            "Kappa": float(Kappa2),
+            "Class_Wise_AA": [float(x) for x in AA2],
+            "timestamp": timestamp
+        }
+
+        # 🚀 保存为 JSON 文件
+        with open(results_json_path, 'w') as f:
+            json.dump(metrics, f, indent=4)
+
+        print(f"📊 测试指标已保存为 JSON 文件：{results_json_path}")
 
     else:
         print("start training")
@@ -411,9 +451,11 @@ def main():
                 val_OA, val_AA, val_Kappa = OA2, AA_mean2, Kappa2
 
                 if OA2 > min_val_obj and epoch > 10:
-                    model_save_path = os.path.join(experiment_dir,
-                                                   f'{args.dataset}_{args.model_name}_p{args.patches}_'
-                                                   f'{round(OA2 * 100, 2)}_epoch{epoch}.pkl')
+                    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M")
+                    model_save_path = os.path.join(
+                        experiment_dir,
+                        f"{args.dataset}_{args.model_name}_p{args.patches}_{round(OA2 * 100, 2)}_epoch{epoch}_{timestamp}.pkl"
+                    )
                     torch.save(model.state_dict(), model_save_path)
 
                     min_val_obj = OA2
