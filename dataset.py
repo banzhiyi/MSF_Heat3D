@@ -362,29 +362,24 @@ def chooose_train_and_test_point(train_data, test_data, true_data, num_classes):
     pos_test = {}
     number_true = []
     pos_true = {}
-
     for i in range(num_classes):
         each_class = []
         each_class = np.argwhere(train_data == (i + 1))
         number_train.append(each_class.shape[0])
         pos_train[i] = each_class
-
     total_pos_train = pos_train[0]
     for i in range(1, num_classes):
         total_pos_train = np.r_[total_pos_train, pos_train[i]]
     total_pos_train = total_pos_train.astype(int)
-
     for i in range(num_classes):
         each_class = []
         each_class = np.argwhere(test_data == (i + 1))
         number_test.append(each_class.shape[0])
         pos_test[i] = each_class
-
     total_pos_test = pos_test[0]
     for i in range(1, num_classes):
         total_pos_test = np.r_[total_pos_test, pos_test[i]]
     total_pos_test = total_pos_test.astype(int)
-
     for i in range(num_classes + 1):
         each_class = []
         each_class = np.argwhere(true_data == i)

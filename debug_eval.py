@@ -19,6 +19,29 @@ print("device:", device)
 
 # --- 加载数据（会打印和构造 loader） ---
 label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true = prepare_dataset(args)
+# 🔍 检查数据加载器中的类别分布
+print("\n================= 数据加载检查 =================")
+all_train_labels = []
+all_test_labels = []
+all_true_labels = []
+
+for _, y in label_train_loader:
+    all_train_labels.extend(y.numpy())
+for _, y in label_test_loader:
+    all_test_labels.extend(y.numpy())
+for _, y in label_true_loader:
+    all_true_labels.extend(y.numpy())
+
+print(f"Train label unique: {np.unique(all_train_labels)}")
+print(f"Test  label unique: {np.unique(all_test_labels)}")
+print(f"True  label unique: {np.unique(all_true_labels)}")
+
+# 🔍 如果发现 0 类缺失，提示用户
+if 0 not in np.unique(all_train_labels):
+    print("⚠️ [警告] 训练集中未包含类别 0！")
+if 0 not in np.unique(all_test_labels):
+    print("⚠️ [警告] 测试集中未包含类别 0！")
+print("================================================\n")
 
 print("num_classes(from prepare_dataset):", num_classes)
 print("label_true_loader batch_size:", args.batch_size)

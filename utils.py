@@ -35,7 +35,7 @@ def output_metric(tar, pre):
     OA, AA_mean, Kappa, AA = cal_results(matrix)
     return OA, AA_mean, Kappa, AA
 """
-
+"""
 def output_metric(tar, pre, num_classes):
     # tar, pre: numpy arrays
     # 忽略 background (0)
@@ -49,6 +49,26 @@ def output_metric(tar, pre, num_classes):
     labels = list(range(num_classes))
     matrix = confusion_matrix(tar_v, pre_v, labels=labels)
     OA, AA_mean, Kappa, AA = cal_results(matrix)
+    return OA, AA_mean, Kappa, AA
+"""
+def output_metric(tar, pre, num_classes):
+    """清理后的版本，保留必要信息"""
+    tar = np.array(tar)
+    pre = np.array(pre)
+
+    # 统一标签映射
+    if np.min(tar) == 0 and np.max(tar) == num_classes - 1:
+        tar_mapped, pre_mapped, labels = tar, pre, list(range(num_classes))
+    elif np.min(tar) == 1 and np.max(tar) == num_classes:
+        tar_mapped, pre_mapped = tar - 1, pre - 1
+        labels = list(range(num_classes))
+    else:
+        labels = sorted(np.unique(np.concatenate([tar, pre])))
+        tar_mapped, pre_mapped = tar, pre
+
+    matrix = confusion_matrix(tar_mapped, pre_mapped, labels=labels)
+    OA, AA_mean, Kappa, AA = cal_results(matrix)
+
     return OA, AA_mean, Kappa, AA
 
 def cal_results(matrix):
