@@ -380,7 +380,7 @@ def main():
 
         # ✅ 计算 OA、AA、Kappa
         pre_t = np.array(pre_u)
-        OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_t, pre_t, num_classes)
+        OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_t, pre_t, num_classes, 'test')
 
         # 🆕 保存最终测试结果
         save_final_results(experiment_dir, OA2, AA_mean2, Kappa2, AA2, 0)
@@ -426,7 +426,7 @@ def main():
             model.train()
             train_acc, train_obj, tar_t, pre_t = train_epoch(model, label_train_loader, criterion, optimizer, device)
             scheduler.step()
-            OA1, AA_mean1, Kappa1, AA1 = output_metric(tar_t, pre_t, num_classes)
+            OA1, AA_mean1, Kappa1, AA1 = output_metric(tar_t, pre_t, num_classes, 'train')
 
             # 🆕 获取当前学习率
             current_lr = optimizer.param_groups[0]['lr']
@@ -442,7 +442,7 @@ def main():
             if (epoch % args.test_freq == 0) | (epoch == args.epoches - 1):
                 model.eval()
                 tar_v, pre_v = valid_epoch(model, label_test_loader, criterion, optimizer, device)
-                OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_v, pre_v, num_classes)
+                OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_v, pre_v, num_classes, 'train')
                 print("OA: {:.4f} AA: {:.4f} Kappa: {:.4f}"
                       .format(OA2, AA_mean2, Kappa2))
                 print("*************************")
