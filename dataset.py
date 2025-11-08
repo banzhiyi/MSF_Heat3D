@@ -11,30 +11,30 @@ def prepare_dataset(args, samples_type='ratio'):
         data = loadmat('./data/IndianPine.mat')
         TR = data['TR']
         TE = data['TE']
-        input = data['input']  # (145,145,200)
+        input = data['input']
     elif args.dataset == 'Berlin':
         data = loadmat('./data/Berlin/data_HS_LR.mat')
         data_train = loadmat('./data/Berlin/TrainImage.mat')
         data_test = loadmat('./data/Berlin/TestImage.mat')
         TR = data_train['TrainImage']
         TE = data_test['TestImage']
-        input = data['data_HS_LR']  # (1723,476,244)
+        input = data['data_HS_LR']
     elif args.dataset == 'Augsburg':
         data = loadmat('./data/Augsburg/data_HS_LR.mat')
         data_train = loadmat('./data/Augsburg/TrainImage.mat')
         data_test = loadmat('./data/Augsburg/TestImage.mat')
         TR = data_train['TrainImage']
         TE = data_test['TestImage']
-        input = data['data_HS_LR']  # (332,485,180)
+        input = data['data_HS_LR']
     else:
         raise ValueError("Unknown dataset")
 
     label = TR + TE
     num_classes = np.max(TR)
+
     # train data change to the ratio of train samples
     if samples_type == 'ratio':
-        training_ratio = 1  # range from 0 to 1, e.g. training_ratio=0.5 means 50% training samples.
-        print('Train data change to the ratio of train samples: {}'.format(training_ratio))
+        training_ratio = 1
         train_idx, TR = split_train_data_clssnum(TR, num_classes, training_ratio)
 
     # normalize data by band norm
@@ -43,16 +43,17 @@ def prepare_dataset(args, samples_type='ratio'):
         input_max = np.max(input[:, :, i])
         input_min = np.min(input[:, :, i])
         input_normalize[:, :, i] = (input[:, :, i] - input_min) / (input_max - input_min)
+
     # data size
     height, width, band = input.shape
     print("height={0},width={1},band={2}".format(height, width, band))
-    # -------------------------------------------------------------------------------
+
     # obtain train and test data
     total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(
         TR, TE, label, num_classes)
     mirror_image = mirror_hsi(height, width, band, input_normalize, patch=args.patches)
 
-    # 🚀 关键修改：智能选择数据加载策略
+    # 智能选择数据加载策略
     x_train_band, x_test_band, x_true_band = train_and_test_data_optimized(
         mirror_image, band, total_pos_train, total_pos_test,
         patch=args.patches, true_point=total_pos_true, dataset_name=args.dataset
@@ -60,12 +61,11 @@ def prepare_dataset(args, samples_type='ratio'):
 
     y_train, y_test, y_true = train_and_test_label(number_train, number_test, num_classes, number_true)
 
-    # 🚀 关键修改：统一的数据加载器创建
+    # 统一的数据加载器创建
     label_train_loader, label_test_loader, label_true_loader = create_universal_dataloaders(
         x_train_band, x_test_band, x_true_band, y_train, y_test, y_true, args.batch_size, args.dataset
     )
 
-    print(f"✅ Dataset band number = {band}")
     return label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true
 
 
@@ -355,6 +355,7 @@ def split_train_data_clssnum(gt, num_classes, train_num_ratio):
 
 
 # 定位训练和测试样本
+"""
 def chooose_train_and_test_point(train_data, test_data, true_data, num_classes):
     number_train = []
     pos_train = {}
@@ -392,8 +393,52 @@ def chooose_train_and_test_point(train_data, test_data, true_data, num_classes):
     total_pos_true = total_pos_true.astype(int)
 
     return total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true
+"""
+def chooose_train_and_test_point(train_data, test_data, true_data, num_classes):
+    number_train = []
+    pos_train = {}
+    number_test = []
+    pos_test = {}
+    number_true = []
+    pos_true = {}
 
+    # 只考虑非零标签（排除背景）
+    for i in range(num_classes):
+        # 训练数据：只考虑类别 i+1
+        each_class = np.argwhere(train_data == (i + 1))
+        number_train.append(each_class.shape[0])
+        pos_train[i] = each_class
 
+    # 合并所有训练点（排除背景）
+    total_pos_train = pos_train[0]
+    for i in range(1, num_classes):
+        total_pos_train = np.r_[total_pos_train, pos_train[i]]
+    total_pos_train = total_pos_train.astype(int)
+
+    for i in range(num_classes):
+        # 测试数据：只考虑类别 i+1
+        each_class = np.argwhere(test_data == (i + 1))
+        number_test.append(each_class.shape[0])
+        pos_test[i] = each_class
+
+    # 合并所有测试点（排除背景）
+    total_pos_test = pos_test[0]
+    for i in range(1, num_classes):
+        total_pos_test = np.r_[total_pos_test, pos_test[i]]
+    total_pos_test = total_pos_test.astype(int)
+
+    # 全图数据：包含所有像素（包括背景0）
+    for i in range(num_classes + 1):
+        each_class = np.argwhere(true_data == i)
+        number_true.append(each_class.shape[0])
+        pos_true[i] = each_class
+
+    total_pos_true = pos_true[0]
+    for i in range(1, num_classes + 1):
+        total_pos_true = np.r_[total_pos_true, pos_true[i]]
+    total_pos_true = total_pos_true.astype(int)
+
+    return total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true
 # 边界拓展：镜像
 def mirror_hsi(height, width, band, input_normalize, patch=5):
     padding = patch // 2

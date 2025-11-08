@@ -37,22 +37,6 @@ def output_metric(tar, pre):
 """
 """
 def output_metric(tar, pre, num_classes):
-    # tar, pre: numpy arrays
-    # 忽略 background (0)
-    mask = tar != 0
-    tar_v = tar[mask]
-    pre_v = pre[mask]
-    # 若 tar_v 最大为 num_classes (1..C)，转为 0..C-1
-    if tar_v.max() == num_classes:
-        tar_v = tar_v - 1
-
-    labels = list(range(num_classes))
-    matrix = confusion_matrix(tar_v, pre_v, labels=labels)
-    OA, AA_mean, Kappa, AA = cal_results(matrix)
-    return OA, AA_mean, Kappa, AA
-"""
-"""
-def output_metric(tar, pre, num_classes):
     #清理后的版本，保留必要信息
     tar = np.array(tar)
     pre = np.array(pre)
@@ -73,8 +57,9 @@ def output_metric(tar, pre, num_classes):
     return OA, AA_mean, Kappa, AA
 """
 # 在 utils.py 的 output_metric 函数中检查
+"""
 def output_metric(tar, pre, num_classes, dataset_name='Indian', mode='test'):
-    """
+    
     统一的指标计算函数
     Args:
         tar: 真实标签
@@ -82,7 +67,7 @@ def output_metric(tar, pre, num_classes, dataset_name='Indian', mode='test'):
         num_classes: 类别数（不包括背景）
         dataset_name: 数据集名称
         mode: 'train' 或 'test'
-    """
+    
     tar = np.array(tar)
     pre = np.array(pre)
 
@@ -120,6 +105,75 @@ def output_metric(tar, pre, num_classes, dataset_name='Indian', mode='test'):
     matrix = confusion_matrix(tar_mapped, pre_mapped, labels=labels)
     OA, AA_mean, Kappa, AA = cal_results(matrix)
 
+    return OA, AA_mean, Kappa, AA
+"""
+def output_metric(tar, pre, num_classes, dataset_name='Unknown', mode='train'):
+    """
+    统一的指标计算函数
+    Args:
+        tar: 真实标签
+        pre: 预测标签
+        num_classes: 类别数（不包括背景）
+        dataset_name: 数据集名称
+        mode: 'train' 或 'test'
+    """
+    tar = np.array(tar)
+    pre = np.array(pre)
+
+    # 🎯 数据集特定的处理策略
+    if dataset_name == 'Indian':
+        # IndianPines: 训练[0-15], 测试[0-16]需要过滤背景
+        if mode == 'test':
+            valid_mask = tar != 0
+            tar_filtered = tar[valid_mask]
+            pre_filtered = pre[valid_mask]
+            # IndianPines 测试标签从1开始，需要映射到0开始
+            if np.min(tar_filtered) == 1 and np.max(tar_filtered) == num_classes:
+                tar_mapped = tar_filtered - 1
+                pre_mapped = pre_filtered
+            else:
+                tar_mapped = tar_filtered
+                pre_mapped = pre_filtered
+        else:
+            # 训练模式，通常已经处理好
+            if np.min(tar) == 0 and np.max(tar) == num_classes - 1:
+                tar_mapped, pre_mapped = tar, pre
+            else:
+                tar_mapped, pre_mapped = tar - 1, pre
+
+    elif dataset_name == 'Berlin':
+        # Berlin数据集处理逻辑
+        if mode == 'train':
+            # 训练模式 - 使用通用处理
+            tar_mapped, pre_mapped = tar, pre
+        else:
+            #过滤有效类别 [1,8] 并映射到 [0,7]
+            valid_mask = (tar >= 1) & (tar <= num_classes)
+            tar_filtered = tar[valid_mask]
+            pre_filtered = pre[valid_mask]
+
+            # 将标签从[1,8]映射到[0,7]
+            tar_mapped = tar_filtered - 1
+            pre_mapped = pre_filtered
+
+    else:  # Augsburg或其他数据集
+        # 通用处理逻辑
+        if mode == 'test' and 0 in tar and np.max(tar) == num_classes:
+            valid_mask = tar != 0
+            tar_filtered = tar[valid_mask]
+            pre_filtered = pre[valid_mask]
+            tar_mapped = tar_filtered - 1
+            pre_mapped = pre_filtered
+        elif np.min(tar) == 1 and np.max(tar) == num_classes:
+            tar_mapped = tar - 1
+            pre_mapped = pre
+        else:
+            tar_mapped, pre_mapped = tar, pre
+
+    labels = list(range(num_classes))
+
+    matrix = confusion_matrix(tar_mapped, pre_mapped, labels=labels)
+    OA, AA_mean, Kappa, AA = cal_results(matrix)
     return OA, AA_mean, Kappa, AA
 
 def cal_results(matrix):

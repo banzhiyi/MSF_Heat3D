@@ -376,11 +376,10 @@ def main():
         # 🚀 更新：保存文件名包含数据集名称
         output_mat_path = os.path.join(experiment_dir, f'{args.dataset}_classification_map.mat')
         savemat(output_mat_path, {'P': prediction_matrix, 'label': label})
-        print(f"✅ 预测矩阵已保存至 {output_mat_path}")
 
         # ✅ 计算 OA、AA、Kappa
         pre_t = np.array(pre_u)
-        OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_t, pre_t, num_classes, 'test')
+        OA2, AA_mean2, Kappa2, AA2 = output_metric(tar_t, pre_t, num_classes, args.dataset,'test')
 
         # 🆕 保存最终测试结果
         save_final_results(experiment_dir, OA2, AA_mean2, Kappa2, AA2, 0)
