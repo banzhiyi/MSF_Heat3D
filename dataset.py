@@ -3,7 +3,7 @@ import torch.utils.data as Data
 from scipy.io import loadmat
 import numpy as np
 import os
-
+import h5py
 
 def prepare_dataset(args, samples_type='ratio'):
     # prepare data
@@ -26,11 +26,110 @@ def prepare_dataset(args, samples_type='ratio'):
         TR = data_train['TrainImage']
         TE = data_test['TestImage']
         input = data['data_HS_LR']
+    elif args.dataset == 'Houston':  # 🆕 修复 Houston 数据集加载逻辑
+        if samples_type == 'train':
+            # 🎯 训练阶段：加载 Houston 2013，并分割为训练集和验证集
+            data_file = './data/Houston/Houston13.mat'
+            label_file = './data/Houston/Houston13_7gt.mat'
+
+            print(f"训练阶段：加载 Houston 2013")
+            with h5py.File(data_file, 'r') as f:
+                input = f['ori_data'][()]  # (48, 954, 210)
+            with h5py.File(label_file, 'r') as f:
+                labels = f['map'][()]  # (954, 210)
+
+            # 调整数据维度
+            input = np.transpose(input, (1, 2, 0))  # (954, 210, 48)
+            labels = labels.astype(np.int32)
+
+            print(f"Houston 2013 数据形状: {input.shape}")
+            print(f"Houston 2013 标签形状: {labels.shape}")
+            print(f"标签唯一值: {np.unique(labels)}")
+
+            # 🎯 关键：将 Houston 2013 分割为训练集和验证集
+            TR = np.zeros_like(labels, dtype=np.int32)
+            TE = np.zeros_like(labels, dtype=np.int32)
+
+            # 获取所有有标签的像素位置
+            labeled_positions = np.argwhere(labels > 0)
+            total_labeled = len(labeled_positions)
+
+            # 随机分割：80% 训练，20% 验证
+            np.random.shuffle(labeled_positions)
+            split_idx = int(0.8 * total_labeled)
+
+            train_positions = labeled_positions[:split_idx]
+            val_positions = labeled_positions[split_idx:]
+
+            # 分配训练集和验证集标签
+            for pos in train_positions:
+                i, j = pos
+                TR[i, j] = labels[i, j]
+
+            for pos in val_positions:
+                i, j = pos
+                TE[i, j] = labels[i, j]
+
+            print(f"训练集样本数: {len(train_positions)}")
+            print(f"验证集样本数: {len(val_positions)}")
+            print(f"训练集标签分布: {np.unique(TR, return_counts=True)}")
+            print(f"验证集标签分布: {np.unique(TE, return_counts=True)}")
+
+        else:
+            # 🎯 测试阶段：加载 Houston 2018 作为测试集
+            data_file = './data/Houston/Houston18.mat'
+            label_file = './data/Houston/Houston18_7gt.mat'
+
+            print(f"测试阶段：加载 Houston 2018")
+            with h5py.File(data_file, 'r') as f:
+                input = f['ori_data'][()]  # (48, 954, 210)
+            with h5py.File(label_file, 'r') as f:
+                labels = f['map'][()]  # (954, 210)
+
+            # 调整数据维度
+            input = np.transpose(input, (1, 2, 0))  # (954, 210, 48)
+            labels = labels.astype(np.int32)
+
+            print(f"Houston 2018 数据形状: {input.shape}")
+            print(f"Houston 2018 标签形状: {labels.shape}")
+            print(f"标签唯一值: {np.unique(labels)}")
+
+            # 🎯 测试阶段：所有有标签像素作为测试集
+            TR = np.zeros_like(labels, dtype=np.int32)  # 训练集为空
+            TE = labels.copy()  # 所有标签作为测试集
+
+            test_samples = np.sum(TE > 0)
+            print(f"测试集样本数: {test_samples}")
+            print(f"测试集标签分布: {np.unique(TE, return_counts=True)}")
+
+            # 🎯 关键修复：在测试阶段，我们需要设置正确的 num_classes
+            # 虽然 TR 是空的，但我们应该根据 TE 的最大值来设置 num_classes
+            if np.max(TE) > 0:
+                num_classes_from_te = int(np.max(TE))
+            else:
+                num_classes_from_te = 7  # Houston 数据集有 7 个类别
+
+            print(f"测试阶段：根据测试集设置类别数 = {num_classes_from_te}")
     else:
         raise ValueError("Unknown dataset")
 
     label = TR + TE
-    num_classes = np.max(TR)
+    #num_classes = np.max(TR)
+    # 🎯 修复：在 Houston 测试阶段特殊处理 num_classes
+    if args.dataset == 'Houston' and samples_type == 'test':
+        # 测试阶段：TR 是空的，我们需要根据 TE 来设置 num_classes
+        if np.max(TE) > 0:
+            num_classes = int(np.max(TE))
+        else:
+            num_classes = 7  # Houston 数据集默认有 7 个类别
+        print(f"Houston 测试阶段：设置类别数 = {num_classes}")
+    else:
+        # 其他情况正常计算
+        num_classes = int(np.max(TR)) if np.max(TR) > 0 else int(np.max(TE))
+
+    print(f"数据集: {args.dataset}, 类别数: {num_classes}")
+    print(f"TR 最大值: {np.max(TR)}, TE 最大值: {np.max(TE)}")
+    print(f"标签唯一值: {np.unique(label)}")
 
     # train data change to the ratio of train samples
     if samples_type == 'ratio':
@@ -74,18 +173,29 @@ def create_universal_dataloaders(x_train_band, x_test_band, x_true_band, y_train
                                  dataset_name):
     """统一的数据加载器创建，兼容所有数据集"""
 
-    # 训练集：总是使用原始Tensor方式（确保性能）
-    if isinstance(x_train_band, np.ndarray):
-        x_train = torch.from_numpy(x_train_band.transpose(0, 3, 1, 2)).float()
-    else:
-        # 如果是文件路径，加载为数组
-        x_train_band_data = np.load(x_train_band, mmap_mode='r')
-        x_train = torch.from_numpy(x_train_band_data.transpose(0, 3, 1, 2)).float()
+    # 🎯 修复：处理空训练集的情况（测试阶段）
+    if len(y_train) > 0:
+        # 训练集：总是使用原始Tensor方式（确保性能）
+        if isinstance(x_train_band, np.ndarray):
+            x_train = torch.from_numpy(x_train_band.transpose(0, 3, 1, 2)).float()
+        else:
+            # 如果是文件路径，加载为数组
+            x_train_band_data = np.load(x_train_band, mmap_mode='r')
+            x_train = torch.from_numpy(x_train_band_data.transpose(0, 3, 1, 2)).float()
 
-    y_train_tensor = torch.from_numpy(y_train).long()
-    train_dataset = Data.TensorDataset(x_train, y_train_tensor)
-    label_train_loader = Data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    print(f"✅ 训练集加载完成: {len(train_dataset)} 个样本")
+        y_train_tensor = torch.from_numpy(y_train).long()
+        train_dataset = Data.TensorDataset(x_train, y_train_tensor)
+        label_train_loader = Data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        print(f"✅ 训练集加载完成: {len(train_dataset)} 个样本")
+    else:
+        # 🎯 修复：创建真正可用的空DataLoader
+        print("⚠️ 训练集为空（测试阶段正常情况）")
+        # 创建一个包含单个虚拟样本的数据集，但实际不会使用
+        dummy_data = torch.zeros(1, 48, 7, 7)  # 根据你的数据形状调整
+        dummy_labels = torch.zeros(1, dtype=torch.long)
+        dummy_dataset = Data.TensorDataset(dummy_data, dummy_labels)
+        label_train_loader = Data.DataLoader(dummy_dataset, batch_size=1, shuffle=False)
+        # 注意：这个DataLoader实际上不会被使用，只是为了满足代码结构
 
     # 测试集：根据数据集大小选择策略
     test_samples = len(y_test)

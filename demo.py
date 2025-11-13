@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
 parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
-parser.add_argument('--dataset', choices=['Indian', 'Berlin', 'Augsburg'], default='Indian', help='dataset to use')
+parser.add_argument('--dataset', choices=['Indian', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
 parser.add_argument('--model_name', choices=['s2vnet'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
@@ -275,7 +275,21 @@ def main():
     save_experiment_config(args, experiment_dir)
 
     ## prepare dataset
-    label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true = prepare_dataset(
+    # 🆕 对于 Houston 数据集，需要分别准备训练集和测试集
+    if args.dataset == 'Houston':
+        if args.flag_test == 'train':
+            # 训练阶段：加载 Houston 2013 作为训练集和验证集
+            print("🚀 训练阶段：加载 Houston 2013 数据集")
+            label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true = prepare_dataset(
+                args, samples_type='train')
+        else:
+            # 测试阶段：加载 Houston 2018 作为测试集
+            print("🧪 测试阶段：加载 Houston 2018 数据集")
+            label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true = prepare_dataset(
+                args, samples_type='test')
+    else:
+    # 其他数据集保持原有逻辑
+        label_train_loader, label_test_loader, label_true_loader, band, height, width, num_classes, label, total_pos_true = prepare_dataset(
         args)
 
     # create model
@@ -301,6 +315,14 @@ def main():
     if args.flag_test == 'test':
         print("🚀 Start testing...")
         model.eval()
+        # 🆕 添加 Houston 数据集测试阶段的兼容性检查
+        if args.dataset == 'Houston':
+            print("🧪 Houston 测试阶段：使用 Houston 2018 数据集进行测试")
+            # 检查测试集是否有样本
+            if len(label_test_loader.dataset) == 0:
+                print("⚠️ 测试阶段：测试集为空，使用全图数据进行测试")
+            else:
+                print(f"✅ 测试集样本数: {len(label_test_loader.dataset)}")
 
         # ✅ 自动选择模型权重路径（根据当前数据集）
         branch_name = get_git_branch_name()
