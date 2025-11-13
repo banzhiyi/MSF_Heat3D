@@ -6,6 +6,7 @@ import torch.backends.cudnn as cudnn
 from scipy.io import savemat
 from torch import optim
 from s2vnet_model import S2VNet
+from vheat3d_model import S2VHeat3D
 from utils import AvgrageMeter, accuracy, output_metric, NonZeroClipper, print_args
 from dataset import prepare_dataset
 import numpy as np
@@ -23,7 +24,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet', 'vheat3d'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -145,7 +146,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         batch_target = batch_target.to(device)
 
         optimizer.zero_grad()
-        if 's2vnet' in args.model_name:
+        if args.model_name == 's2vnet':
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, feature_abu, edm_per = model(batch_data)
 
             band = re_unmix.shape[1] // 2  # 2 represents the number of decoder layer
@@ -172,6 +173,10 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
                                              (torch.norm(re_unmix, dim=1, p=2) * torch.norm(batch_data, dim=1,
                                                                                             p=2) + 1e-5)))
             loss = criterion(batch_pred, batch_target) + sad_loss + 0.01 * kl_div + 0.01 * loss_tv + 0.01 * loss_tv_abu
+        elif args.model_name == 'vheat3d':
+            # 🆕 vheat3d 只需要分类损失
+            batch_pred = model(batch_data)
+            loss = criterion(batch_pred, batch_target)
         else:
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
@@ -197,7 +202,7 @@ def valid_epoch(model, valid_loader, criterion, optimizer, device):
         batch_data = batch_data.to(device)
         batch_target = batch_target.to(device)
 
-        if 's2vnet' in args.model_name:
+        if args.model_name == 's2vnet':
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, _, _ = model(batch_data)
 
             band = re_unmix.shape[1] // 2  # 2 represents the number of decoder layer
@@ -207,6 +212,9 @@ def valid_epoch(model, valid_loader, criterion, optimizer, device):
             sad_loss = torch.mean(torch.acos(torch.sum(batch_data * re_unmix, dim=1) /
                                              (torch.norm(re_unmix, dim=1, p=2) * torch.norm(batch_data, dim=1, p=2))))
             loss = criterion(batch_pred, batch_target) + sad_loss
+        elif args.model_name == 'vheat3d':
+            batch_pred = model(batch_data)
+            loss = criterion(batch_pred, batch_target)
         else:
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
@@ -232,6 +240,8 @@ def test_epoch(model, test_loader, device):
         # 模型前向传播
         if args.model_name == 's2vnet':
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, _, _ = model(batch_data)
+        elif args.model_name == 'vheat3d':
+            batch_pred = model(batch_data)  # 🆕 vheat3d 直接输出分类结果
         else:
             batch_pred = model(batch_data)
 
@@ -295,6 +305,8 @@ def main():
     # create model
     if args.model_name == 's2vnet':
         model = S2VNet(band, num_classes, args.patches)
+    elif args.model_name == 'vheat3d':
+        model = S2VHeat3D(band, num_classes, args.patches)
     else:
         raise KeyError("{} model is unknown.".format(args.model_name))
     model = model.to(device)
@@ -304,8 +316,9 @@ def main():
     criterion = nn.CrossEntropyLoss().to(device)
     # Set the optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
-    apply_nonegative = NonZeroClipper()
+    # 🆕 修改：只有 s2vnet 需要应用 NonZeroClipper
+    if args.model_name == 's2vnet':
+        apply_nonegative = NonZeroClipper()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epoches // 10, gamma=args.gamma)
 
     # 🆕 初始化训练日志
@@ -371,6 +384,8 @@ def main():
                 with torch.no_grad():
                     if args.model_name == 's2vnet':
                         _, _, batch_pred, _, _, _, _ = model(x_tensor)
+                    elif args.model_name == 'vheat3d':
+                        batch_pred = model(x_tensor)  # 🆕 vheat3d 直接输出分类结果
                     else:
                         batch_pred = model(x_tensor)
 
