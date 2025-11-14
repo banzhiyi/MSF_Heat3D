@@ -117,6 +117,8 @@ def log_training_epoch(log_path, epoch, train_loss, train_acc, val_OA, val_AA, v
 # 🆕 保存最终测试结果
 def save_final_results(experiment_dir, OA, AA, Kappa, class_AA, training_time, best_epoch=None):
     """保存最终测试结果到JSON文件"""
+    if class_AA is None:
+        class_AA = []
     results = {
         'dataset': args.dataset,
         'final_OA': float(OA),
@@ -472,8 +474,9 @@ def main():
 
             print("Epoch: {:03d} train_loss: {:.4f} train_acc: {:.4f}"
                   .format(epoch + 1, train_obj, train_acc))
-
-            model.unmix_decoder.apply(apply_nonegative)  # regularize unmix decoder
+            # 🆕 只有 s2vnet 需要应用 NonZeroClipper
+            if args.model_name == 's2vnet':
+                model.unmix_decoder.apply(apply_nonegative)  # regularize unmix decoder
 
             if (epoch % args.test_freq == 0) | (epoch == args.epoches - 1):
                 model.eval()

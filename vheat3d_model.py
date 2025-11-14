@@ -18,7 +18,7 @@ class LayerNorm3d(nn.Module):
     It accepts inputs in either (B, C, S, H, W) or (B, H, W, S, C).
     """
 
-    def __init__(self, hidden_dim, eps=1e-6, debug=True):
+    def __init__(self, hidden_dim, eps=1e-6, debug=False):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim, eps=eps)
         self.hidden_dim = hidden_dim
@@ -109,37 +109,28 @@ class StemLayer3D(nn.Module):
 
 
 class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
-                 channels_first=False):
+    def __init__(self, in_features, hidden_features=None, out_features=None,
+                 act_layer=nn.GELU, drop=0., channels_first=True):
         super().__init__()
+        assert channels_first, "3D MLP must use channels_first=True for (B,C,S,H,W)"
+
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
-        Linear = partial(nn.Conv3d, kernel_size=1, padding=0) if channels_first else nn.Linear
-        self.fc1 = Linear(in_features, hidden_features)
+        self.fc1 = nn.Conv3d(in_features, hidden_features, kernel_size=1, bias=True)
         self.act = act_layer()
-        self.fc2 = Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
-        self.channels_first = channels_first
+        self.fc2 = nn.Conv3d(hidden_features, out_features, kernel_size=1, bias=True)
 
     def forward(self, x):
-        # x 形状: (B, C, S, H, W)
-        if not self.channels_first:
-            # 如果不是 channels_first，需要重塑
-            B, C, S, H, W = x.shape
-            x = x.permute(0, 2, 3, 4, 1).reshape(-1, C)  # (B*S*H*W, C)
-
+        # x: (B, C, S, H, W)
         x = self.fc1(x)
         x = self.act(x)
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
-
-        if not self.channels_first:
-            # 恢复原始形状
-            x = x.reshape(B, S, H, W, -1).permute(0, 4, 1, 2, 3)  # (B, out_features, S, H, W)
-
         return x
+
 
 
 class Heat3D(nn.Module):
@@ -239,109 +230,141 @@ class Heat3D(nn.Module):
 
     def forward(self, x: torch.Tensor, freq_embed=None):
         """
+        Stable channels-first implementation.
         x: (B, C_in, S, H, W)
         return: (B, C, S, H, W)
-        Notes:
-          - This implementation keeps channels-first everywhere: (B, C, S, H, W).
-          - Builds kx_exp/ky_exp/ks_exp in shapes broadcastable to x: (1,C,1,H,1), (1,C,1,1,W), (1,C,S,1,1).
         """
         B, C_in, S, H, W = x.shape
         device, dtype = x.device, x.dtype
         C = self.hidden_dim
 
-        # 1) local 3D conv -> (B, hidden_dim, S, H, W)
-        x = self.local3d(x)  # (B, C, S, H, W)
+        # 1) local conv -> (B, C, S, H, W)
+        x = self.local3d(x)  # (B, hidden_dim, S, H, W)
 
-        # 2) linear -> two branches (we do linear on channels-last temporarily then back)
-        # convert to channels-last for applying self.linear (which expects last dim features)
+        # 2) Linear -> split into main & gate branches.
+        # self.linear expects last-dim features -> temporarily move channels to last
         x_cl = x.permute(0, 2, 3, 4, 1).contiguous()  # (B, S, H, W, C)
         x_lin = self.linear(x_cl)  # (B, S, H, W, 2C)
-        x_main, z = x_lin.chunk(2, dim=-1)  # each (B, S, H, W, C)
+        x_main, z = x_lin.chunk(2, dim=-1)  # (B, S, H, W, C) each
         # back to channels-first
         x = x_main.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, S, H, W)
         z = z.permute(0, 4, 1, 2, 3).contiguous()  # (B, C, S, H, W)
 
-        # 3) prepare DCT bases if needed
+        # 3) prepare dct bases
         self._prepare_bases(S, H, W, device, dtype)
-        W_h, W_w, W_s = self._Wcos_h, self._Wcos_w, self._Wcos_s  # shapes (H,H), (W,W), (S,S)
+        W_h, W_w, W_s = self._Wcos_h, self._Wcos_w, self._Wcos_s  # shapes: (H,H),(W,W),(S,S)
 
-        # 4) DCT3D on channels-first (apply along S, H, W axes)
-        # Note: einsum indices chosen to avoid name reuse. Use:
-        #  x: b c s h w
-        #  W_s: s t  -> result b c t h w  (t indexes freq)
-        x = torch.einsum('bcshw,st->bcthw', x, W_s)  # (B, C, S, H, W) with S replaced by freq index (still size S)
-        x = torch.einsum('bcthw,ht->bcttw', x, W_h)  # careful labels: second einsum maps H->new index (keeps dims)
-        # The above two-step einsum can be simplified but kept explicit: do H then W properly
-        # do H:
-        x = torch.einsum('bcthw,ht->bcttw', x, W_h)  # intermediate (labels reused intentionally but sizes align)
-        # do W:
-        x = torch.einsum('bcttw,wt->bcttw', x, W_w)  # final DCT result shape (B,C,S,H,W)
+        # ---------- Forward DCT along S, then H, then W ----------
+        # --- transform S axis ---
+        # bring S to last: (B,C,S,H,W) -> permute -> (B,C,H,W,S)
+        x_perm = x.permute(0, 1, 3, 4, 2).contiguous()  # (B,C,H,W,S)
+        x_2d = x_perm.view(-1, S)  # (B*C*H*W, S)
+        # multiply by W_s^T to project: result (B*C*H*W, S)
+        x_2d = x_2d @ W_s.t()  # (B*C*H*W, S)
+        x_perm = x_2d.view(B, C, H, W, S)  # (B,C,H,W,S)
+        x = x_perm.permute(0, 1, 4, 2, 3).contiguous()  # back to (B,C,S,H,W)
 
-        # The three einsums above are kept explicit; if einsum labels confuse, you can do explicit matmul per axis:
-        # e.g. reshape and use @ with correct transposes. The goal is: x remains (B,C,S,H,W).
+        # --- transform H axis ---
+        x_perm = x.permute(0, 1, 2, 4, 3).contiguous()  # (B,C,S,W,H) bring H to last
+        x_2d = x_perm.view(-1, H)  # (B*C*S*W, H)
+        x_2d = x_2d @ W_h.t()  # (B*C*S*W, H)
+        x_perm = x_2d.view(B, C, S, W, H)  # (B,C,S,W,H)
+        x = x_perm.permute(0, 1, 2, 4, 3).contiguous()  # back to (B,C,S,H,W)
 
-        # 5) frequency decay (make kx_exp/ky_exp/ks_exp broadcastable to (B,C,S,H,W))
-        if self.infer_mode and (self.kx_exp is not None):
-            kx_exp = self.kx_exp  # expected shapes will be handled if pre-baked (but ensure they are channels-first)
-            ky_exp = self.ky_exp
-            ks_exp = self.ks_exp
-            # If pre-baked were created differently, ensure shapes -> (1,C,1,H,1) etc.
-            # We'll try to reshape if possible:
-            if kx_exp is not None and kx_exp.ndim == 4:  # maybe (H,1,1,C)
-                kx_exp = kx_exp.permute(3, 0, 1, 2).unsqueeze(0)  # -> (1,C,H,1,1) then reshape to (1,C,1,H,1)
-                kx_exp = kx_exp.reshape(1, C, 1, H, 1)
-            # similar adjustments could be done for ky_exp/ks_exp if needed
+        # --- transform W axis ---
+        x_2d = x.view(-1, W)  # (B*C*S*H, W) since W is last already
+        x_2d = x_2d @ W_w.t()  # (B*C*S*H, W)
+        x = x_2d.view(B, C, S, H, W)  # (B,C,S,H,W)
+
+        # ---------- Frequency-domain damping (make shapes broadcastable) ----------
+        # Build per-channel k vectors
+        if self.to_k is None:
+            kx = ky = ks = torch.ones(C, device=device, dtype=dtype)
         else:
             if self.to_k is None:
-                # constants
-                kx = torch.ones(C, device=device, dtype=dtype)
-                ky = torch.ones(C, device=device, dtype=dtype)
-                ks = torch.ones(C, device=device, dtype=dtype)
+                # 常数 k
+                kx = ky = ks = torch.ones(C, device=device, dtype=dtype)
             else:
-                k_all = self.to_k(freq_embed) if freq_embed is not None else self.to_k(
-                    torch.zeros(1, self.hidden_dim, device=device, dtype=dtype))
-                kx, ky, ks = torch.chunk(k_all, 3, dim=-1)  # each (1, C)
+                # 规范化 freq_embed 到 (1, C) 再输入 to_k
+                if freq_embed is None:
+                    fe = torch.zeros(1, self.hidden_dim, device=device, dtype=dtype)  # (1, C)
+                else:
+                    fe = freq_embed
+                    # 如果最后一维是通道 dim（C），对其他维取均值
+                    if fe.dim() >= 2 and fe.shape[-1] == self.hidden_dim:
+                        # e.g. (H,W,S,C) or (S,C) or (H,W,C) -> average所有非通道维
+                        # 计算需要保留最后一维，其他维取 mean
+                        reduce_dims = tuple(range(fe.dim() - 1))  # e.g. (0,1,2)
+                        fe = fe.mean(dim=reduce_dims)  # becomes (C,)
+                        fe = fe.unsqueeze(0)  # -> (1, C)
+                    elif fe.dim() == 1 and fe.numel() == self.hidden_dim:
+                        fe = fe.unsqueeze(0)  # (1, C)
+                    elif fe.dim() == 2 and fe.shape[1] == self.hidden_dim:
+                        # already (N, C) -- keep as is, we'll take first row if N>1
+                        if fe.shape[0] > 1:
+                            fe = fe.mean(dim=0, keepdim=True)  # aggregate across batch-like dim
+                    else:
+                        # 最后兜底：尝试把张量展平并取前 C 个数作为特征（不常用）
+                        fe = fe.reshape(1, -1)[:, :self.hidden_dim]
+                # 现在 fe 应为 (1, C)
+                k_all = self.to_k(fe)  # expected (1, 3C) or (3C,)
+                # 规范 k_all 到 1D 长向量 (3C,)
+                if k_all.dim() == 2 and k_all.shape[0] == 1:
+                    k_all = k_all.squeeze(0)
+                elif k_all.dim() == 2 and k_all.shape[0] > 1:
+                    # 多行情况：平均到一行
+                    k_all = k_all.mean(dim=0)
+                # 最终切分
+                kx, ky, ks = torch.chunk(k_all, 3, dim=-1)
+                # 确保为 1D 向量 (C,)
+                kx = kx.reshape(-1)
+                ky = ky.reshape(-1)
+                ks = ks.reshape(-1)
+        # alpha bases: self._alpha_h shape (H,), self._alpha_w (W,), self._alpha_s (S,)
+        # create exponentials with shapes broadcastable to (B,C,S,H,W):
+        # kx_exp: (1, C, 1, H, 1)
+        # ky_exp: (1, C, 1, 1, W)
+        # ks_exp: (1, C, S, 1, 1)
+        kx_v = kx.view(1, C, 1, 1, 1)  # (1,C,1,1,1)
+        ky_v = ky.view(1, C, 1, 1, 1)
+        ks_v = ks.view(1, C, 1, 1, 1)
+        alpha_h = self._alpha_h.to(device=device, dtype=dtype).view(1, 1, 1, H, 1)  # (1,1,1,H,1)
+        alpha_w = self._alpha_w.to(device=device, dtype=dtype).view(1, 1, 1, 1, W)  # (1,1,1,1,W)
+        alpha_s = self._alpha_s.to(device=device, dtype=dtype).view(1, 1, S, 1, 1)  # (1,1,S,1,1)
 
-            # Build broadcastable exponentials:
-            # self._alpha_h: (H,), self._alpha_w: (W,), self._alpha_s: (S,)
-            # Want shapes:
-            #   kx_exp: (1, C, 1, H, 1)
-            #   ky_exp: (1, C, 1, 1, W)
-            #   ks_exp: (1, C, S, 1, 1)
-            # Do via broadcasting: (_alpha_h).view(1,1,H,1,1) ** kx.view(1,C,1,1,1)
-            alpha_h = self._alpha_h.to(device=device, dtype=dtype).view(1, 1, H, 1, 1)  # (1,1,H,1,1)
-            alpha_w = self._alpha_w.to(device=device, dtype=dtype).view(1, 1, 1, 1, W)  # (1,1,1,1,W)
-            alpha_s = self._alpha_s.to(device=device, dtype=dtype).view(1, 1, S, 1, 1)  # (1,1,S,1,1)
-            kx_v = kx.view(1, C, 1, 1, 1)  # (1,C,1,1,1)
-            ky_v = ky.view(1, C, 1, 1, 1)
-            ks_v = ks.view(1, C, 1, 1, 1)
-            # Raise base to power per-channel: results have shapes:
-            # alpha_h ** kx_v -> (1,C,H,1,1) -> permute to (1,C,1,H,1) if necessary
-            kx_exp = (alpha_h ** kx_v).permute(0, 1, 2, 3, 4).contiguous()  # yields (1,C,H,1,1)
-            # we want (1,C,1,H,1) so transpose axes:
-            kx_exp = kx_exp.permute(0, 1, 2, 3, 4).reshape(1, C, H, 1, 1).permute(0, 1, 2, 3, 4)
-            # Simpler: directly compute proper shapes:
-            kx_exp = (self._alpha_h.view(1, 1, H, 1, 1).to(device, dtype) ** kx_v)  # (1,C,H,1,1)
-            # Move H to 4th dim: want (1,C,1,H,1) -> permute
-            kx_exp = kx_exp.permute(0, 1, 2, 3,
-                                    4)  # currently (1,C,H,1,1); that's fine for broadcasting with x (B,C,S,H,W) if PyTorch aligns dims.
-            # For clarity, ensure shapes for ky/ks:
-            ky_exp = (self._alpha_w.view(1, 1, 1, 1, W).to(device, dtype) ** ky_v)  # (1,C,1,1,W)
-            ks_exp = (self._alpha_s.view(1, 1, S, 1, 1).to(device, dtype) ** ks_v)  # (1,C,S,1,1)
+        # raise to per-channel powers -> shapes:
+        kx_exp = (alpha_h ** kx_v)  # (1,C,1,H,1)
+        ky_exp = (alpha_w ** ky_v)  # (1,C,1,1,W)
+        ks_exp = (alpha_s ** ks_v)  # (1,C,S,1,1)
 
-        # Multiply in frequency domain (broadcasting works with shapes above)
-        # Ensure x is float dtype matching exponents
-        x = x * kx_exp * ky_exp * ks_exp  # (B, C, S, H, W)
+        # Multiply (broadcasts over batch)
+        x = x * kx_exp * ky_exp * ks_exp  # (B,C,S,H,W)
 
-        # 6) IDCT3D: inverse transforms (apply transposed bases)
-        x = torch.einsum('bcthw,ts->bcshw', x, W_s.t())  # inverse S
-        x = torch.einsum('bcshw,ht->bcstw', x, W_h.t())  # inverse H
-        x = torch.einsum('bcstw,wt->bcshw', x, W_w.t())  # inverse W -> (B,C,S,H,W)
+        # ---------- Inverse DCT (IDCT) along W, H, S using W_.T reversed order ----------
+        # inverse W
+        x_2d = x.view(-1, W)  # (B*C*S*H, W)
+        x_2d = x_2d @ W_w  # multiply by W_w (inverse)
+        x = x_2d.view(B, C, S, H, W)
 
-        # 7) out norm and gating
-        x = self.out_norm(x)  # returns (B,C,S,H,W)
+        # inverse H
+        x_perm = x.permute(0, 1, 2, 4, 3).contiguous()  # (B,C,S,W,H)
+        x_2d = x_perm.view(-1, H)  # (B*C*S*W, H)
+        x_2d = x_2d @ W_h  # (B*C*S*W, H)
+        x_perm = x_2d.view(B, C, S, W, H)
+        x = x_perm.permute(0, 1, 2, 4, 3).contiguous()  # (B,C,S,H,W)
+
+        # inverse S
+        x_perm = x.permute(0, 1, 3, 4, 2).contiguous()  # (B,C,H,W,S)
+        x_2d = x_perm.view(-1, S)  # (B*C*H*W, S)
+        x_2d = x_2d @ W_s  # (B*C*H*W, S)
+        x_perm = x_2d.view(B, C, H, W, S)
+        x = x_perm.permute(0, 1, 4, 2, 3).contiguous()  # (B,C,S,H,W)
+
+        # ---------- Output normalization, gating and linear ----------
+        x = self.out_norm(x)  # LayerNorm3d expects channels-first -> returns (B,C,S,H,W)
         x = x * torch.nn.functional.silu(z)  # z is (B,C,S,H,W)
-        x = self.out_linear(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)  # apply linear on channel-dim safely
+        # out_linear expects last-dim features -> temporarily move channels to last
+        x = self.out_linear(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
 
         return x.contiguous()
 
@@ -412,6 +435,32 @@ class HeatBlock3D(nn.Module):
                 return t.permute(0, 2, 3, 4, 1).contiguous()  # (B, H, W, S, C)
             raise ValueError(f"to_channels_last: cannot determine channel dim for tensor with shape {t.shape}")
 
+        def ensure_op_out_matches(op_out: torch.Tensor, target_shape: tuple, hidden_dim: int):
+            """
+            Ensure op_out becomes channels-first with spatial order matching target_shape=(S,H,W).
+            Returns op_out permuted to (B,C,S,H,W).
+            """
+            # 1) make channels-first if needed
+            if not is_channels_first(op_out, hidden_dim):
+                op_out = to_channels_first(op_out, hidden_dim)
+
+            # 2) if spatial dims already match, return
+            if op_out.shape[2:5] == target_shape:
+                return op_out
+
+            # 3) try permutations of spatial axes (indices 2,3,4)
+            import itertools
+            for perm in itertools.permutations((2, 3, 4)):
+                # build full permute tuple: (0,1,p2,p3,p4)
+                full_perm = (0, 1, perm[0], perm[1], perm[2])
+                permuted = op_out.permute(full_perm).contiguous()
+                if permuted.shape[2:5] == target_shape:
+                    return permuted
+
+            # 4) if not found, raise informative error
+            raise RuntimeError(f"Cannot align op_out spatial dims {op_out.shape[2:5]} to target {target_shape}. "
+                               "Tried channel-first conversion and all spatial permutations.")
+
         # ---------- main ----------
         if x.dim() != 5:
             raise ValueError(f"HeatBlock3D._forward expects 5D tensor, got {x.dim()}D")
@@ -435,24 +484,25 @@ class HeatBlock3D(nn.Module):
             x_cf = x
 
         # Now work in channels-first ordering (x_cf: B,C,S,H,W)
+        target_spatial = x_cf.shape[2:5]  # (S, H, W)
+
         if not self.layer_scale:
             if self.post_norm:
-                # compute op output and ensure it's channels-first
+                # compute op output and ensure it's channels-first AND spatially aligned to x_cf
                 op_out = self.op(x_cf, freq_embed)
-                if not is_channels_first(op_out, hidden):
-                    op_out = to_channels_first(op_out, hidden)
+                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(self.norm1(op_out))
                 if self.mlp_branch:
                     mlp_out = self.mlp(x_cf)
                     if not is_channels_first(mlp_out, hidden):
                         mlp_out = to_channels_first(mlp_out, hidden)
+                    # mlp_out should already be channels-first with correct spatial order (it uses channels_first=True)
                     x_cf = x_cf + self.drop_path(mlp_out)
             else:
                 # norm then op style
                 norm_x = self.norm1(x_cf)
                 op_out = self.op(norm_x, freq_embed)
-                if not is_channels_first(op_out, hidden):
-                    op_out = to_channels_first(op_out, hidden)
+                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(op_out)
                 if self.mlp_branch:
                     norm2_x = self.norm2(x_cf)
@@ -465,26 +515,24 @@ class HeatBlock3D(nn.Module):
             # layer_scale == True branch (same logic but with gammas)
             if self.post_norm:
                 op_out = self.op(x_cf, freq_embed)
-                if not is_channels_first(op_out, hidden):
-                    op_out = to_channels_first(op_out, hidden)
-                x_cf = x_cf + self.drop_path(self.gamma1 * self.norm1(op_out))
+                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                x_cf = x_cf + self.drop_path(self.gamma1.view(1,-1,1,1,1) * self.norm1(op_out))
                 if self.mlp_branch:
                     mlp_out = self.mlp(x_cf)
                     if not is_channels_first(mlp_out, hidden):
                         mlp_out = to_channels_first(mlp_out, hidden)
-                    x_cf = x_cf + self.drop_path(self.gamma2 * self.norm2(mlp_out))
+                    x_cf = x_cf + self.drop_path(self.gamma2.view(1,-1,1,1,1) * self.norm2(mlp_out))
             else:
                 normed = self.norm1(x_cf)
                 op_out = self.op(normed, freq_embed)
-                if not is_channels_first(op_out, hidden):
-                    op_out = to_channels_first(op_out, hidden)
-                x_cf = x_cf + self.drop_path(self.gamma1 * op_out)
+                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                x_cf = x_cf + self.drop_path(self.gamma1.view(1,-1,1,1,1) * op_out)
                 if self.mlp_branch:
                     norm2_x = self.norm2(x_cf)
                     mlp_out = self.mlp(norm2_x)
                     if not is_channels_first(mlp_out, hidden):
                         mlp_out = to_channels_first(mlp_out, hidden)
-                    x_cf = x_cf + self.drop_path(self.gamma2 * mlp_out)
+                    x_cf = x_cf + self.drop_path(self.gamma2.view(1,-1,1,1,1) * mlp_out)
 
         # restore ordering consistent with original input
         if orig_channels_last:
@@ -515,8 +563,8 @@ class AdditionalInputSequential(nn.Sequential):
 class vHeat3D(nn.Module):
     """3D vHeat for hyperspectral data"""
 
-    def __init__(self, patch_size=11, in_chans=1, num_classes=16, depths=[2, 2, 6, 2],
-                 dims=[96, 192, 384, 768], drop_path_rate=0.1, post_norm=True,
+    def __init__(self, patch_size=11, in_chans=1, num_classes=16, depths=[1, 1, 3, 1],
+                 dims=[64, 128, 256, 512], drop_path_rate=0.1, post_norm=True,
                  layer_scale=1e-6, use_checkpoint=False, mlp_ratio=4.0,
                  act_layer='GELU', infer_mode=False, spectral_bands=200, **kwargs):
         super().__init__()
@@ -645,7 +693,9 @@ class vHeat3D(nn.Module):
                 x = layer(x)
         else:
             for i, layer in enumerate(self.layers):
-                x = layer(x, self.freq_embed[i])
+                # 正确写法 — 保留最后一维为通道 C，形状 (H, W, S, C)
+                freq_i = self.freq_embed[i]  # (H, W, S, C)
+                x = layer(x, freq_i)
         return x
 
     def forward(self, x):
@@ -664,8 +714,8 @@ class S2VHeat3D(nn.Module):
             num_classes=num_classes,
             patch_size=patch_size,
             spectral_bands=band,  # 光谱波段数
-            embed_dim=96,
-            depths=[2, 2, 6, 2],
+            embed_dim=64,
+            depths=[1, 1, 3, 1],
             dims=[96, 192, 384, 768],
             mlp_ratio=4.0,
             drop_path_rate=0.1,
