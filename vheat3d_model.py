@@ -716,7 +716,7 @@ class S2VHeat3D(nn.Module):
             spectral_bands=band,  # 光谱波段数
             embed_dim=64,
             depths=[1, 1, 3, 1],
-            dims=[96, 192, 384, 768],
+            dims=[64, 128, 256, 512],
             mlp_ratio=4.0,
             drop_path_rate=0.1,
             layer_scale=1e-6,

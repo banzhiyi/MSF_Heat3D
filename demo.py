@@ -249,7 +249,16 @@ def test_epoch(model, test_loader, device):
 
         # 获取预测类别
         _, pred = batch_pred.topk(1, 1, True, True)
-        pp = pred.squeeze()
+        #pp = pred.squeeze()
+        # 🆕 修复：确保 pred 保持正确的维度
+        if pred.dim() > 1:
+            pp = pred.squeeze()
+        else:
+            pp = pred
+
+        # 🆕 确保 pp 是张量而不是标量
+        if pp.dim() == 0:  # 如果是标量
+            pp = pp.unsqueeze(0)  # 重新添加批次维度
 
         # 收集结果
         pre.extend(pp.detach().cpu().numpy().tolist())
