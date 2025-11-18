@@ -144,6 +144,7 @@ class Heat3D(nn.Module):
         super().__init__()
         self.res = res
         self.hidden_dim = hidden_dim
+        self.input_dim = dim  # 新增：保存输入维度
         self.infer_mode = infer_mode
 
         # 3D 局部前处理
@@ -383,13 +384,34 @@ class HeatBlock3D(nn.Module):
             mlp_ratio: float = 4.0,
             post_norm=True,
             layer_scale=None,
+            # 新增瓶颈结构参数
+            bottleneck_ratio: float = 0.25,
+            use_bottleneck: bool = True,
             **kwargs,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.norm1 = norm_layer(hidden_dim)
+        # 新增：瓶颈结构
+        self.use_bottleneck = use_bottleneck
+        if self.use_bottleneck:
+            self.bottleneck_dim = max(8, int(hidden_dim * bottleneck_ratio))
+            # 压缩卷积
+            self.bottleneck_compress = nn.Conv3d(
+                hidden_dim, self.bottleneck_dim, kernel_size=1, stride=1, bias=True
+            )
+            self.bottleneck_norm = nn.BatchNorm3d(self.bottleneck_dim)
+            self.bottleneck_act = act_layer()
+            # 扩展卷积
+            self.bottleneck_expand = nn.Conv3d(
+                self.bottleneck_dim, hidden_dim, kernel_size=1, stride=1, bias=True
+            )
+
+        # 修改：正确传递维度给Heat3D
+        op_input_dim = self.bottleneck_dim if self.use_bottleneck else hidden_dim
+        op_hidden_dim = self.bottleneck_dim if self.use_bottleneck else hidden_dim
         # 使用 Heat3D 替换 Heat2D
-        self.op = Heat3D(res=res, dim=hidden_dim, hidden_dim=hidden_dim, infer_mode=infer_mode)
+        self.op = Heat3D(res=res, dim=op_input_dim, hidden_dim=op_hidden_dim, infer_mode=infer_mode)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.mlp_branch = mlp_ratio > 0
         if self.mlp_branch:
@@ -485,13 +507,26 @@ class HeatBlock3D(nn.Module):
 
         # Now work in channels-first ordering (x_cf: B,C,S,H,W)
         target_spatial = x_cf.shape[2:5]  # (S, H, W)
+        # 新增：瓶颈压缩
+        if self.use_bottleneck:
+            x_compressed = self.bottleneck_compress(x_cf)
+            x_compressed = self.bottleneck_norm(x_compressed)
+            x_compressed = self.bottleneck_act(x_compressed)
+        else:
+            x_compressed = x_cf
 
         if not self.layer_scale:
             if self.post_norm:
                 # compute op output and ensure it's channels-first AND spatially aligned to x_cf
-                op_out = self.op(x_cf, freq_embed)
-                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                op_out = self.op(x_compressed, freq_embed)
+                op_out = ensure_op_out_matches(op_out, target_spatial, self.bottleneck_dim if self.use_bottleneck else hidden)
+                # 新增：瓶颈扩展
+                if self.use_bottleneck:
+                    op_out = self.bottleneck_expand(op_out)
+                    # 扩展后需要再次确保空间维度匹配
+                    op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(self.norm1(op_out))
+
                 if self.mlp_branch:
                     mlp_out = self.mlp(x_cf)
                     if not is_channels_first(mlp_out, hidden):
@@ -501,8 +536,19 @@ class HeatBlock3D(nn.Module):
             else:
                 # norm then op style
                 norm_x = self.norm1(x_cf)
-                op_out = self.op(norm_x, freq_embed)
-                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                # 瓶颈压缩
+                if self.use_bottleneck:
+                    norm_x_compressed = self.bottleneck_compress(norm_x)
+                    norm_x_compressed = self.bottleneck_norm(norm_x_compressed)
+                    norm_x_compressed = self.bottleneck_act(norm_x_compressed)
+                else:
+                    norm_x_compressed = norm_x
+                op_out = self.op(norm_x_compressed, freq_embed)
+                op_out = ensure_op_out_matches(op_out, target_spatial, self.bottleneck_dim if self.use_bottleneck else hidden)
+                # 瓶颈扩展
+                if self.use_bottleneck:
+                    op_out = self.bottleneck_expand(op_out)
+                    op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(op_out)
                 if self.mlp_branch:
                     norm2_x = self.norm2(x_cf)
@@ -514,9 +560,19 @@ class HeatBlock3D(nn.Module):
         else:
             # layer_scale == True branch (same logic but with gammas)
             if self.post_norm:
-                op_out = self.op(x_cf, freq_embed)
-                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                # 瓶颈压缩
+                if self.use_bottleneck:
+                    x_compressed = self.bottleneck_compress(x_cf)
+                    x_compressed = self.bottleneck_norm(x_compressed)
+                    x_compressed = self.bottleneck_act(x_compressed)
+                op_out = self.op(x_compressed, freq_embed)
+                op_out = ensure_op_out_matches(op_out, target_spatial, self.bottleneck_dim if self.use_bottleneck else hidden)
+                # 瓶颈扩展
+                if self.use_bottleneck:
+                    op_out = self.bottleneck_expand(op_out)
+                    op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(self.gamma1.view(1,-1,1,1,1) * self.norm1(op_out))
+
                 if self.mlp_branch:
                     mlp_out = self.mlp(x_cf)
                     if not is_channels_first(mlp_out, hidden):
@@ -524,8 +580,19 @@ class HeatBlock3D(nn.Module):
                     x_cf = x_cf + self.drop_path(self.gamma2.view(1,-1,1,1,1) * self.norm2(mlp_out))
             else:
                 normed = self.norm1(x_cf)
-                op_out = self.op(normed, freq_embed)
-                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                # 瓶颈压缩
+                if self.use_bottleneck:
+                    normed_compressed = self.bottleneck_compress(normed)
+                    normed_compressed = self.bottleneck_norm(normed_compressed)
+                    normed_compressed = self.bottleneck_act(normed_compressed)
+                else:
+                    normed_compressed = normed
+                op_out = self.op(normed_compressed, freq_embed)
+                op_out = ensure_op_out_matches(op_out, target_spatial, self.bottleneck_dim if self.use_bottleneck else hidden)
+                # 瓶颈扩展
+                if self.use_bottleneck:
+                    op_out = self.bottleneck_expand(op_out)
+                    op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(self.gamma1.view(1,-1,1,1,1) * op_out)
                 if self.mlp_branch:
                     norm2_x = self.norm2(x_cf)
@@ -707,7 +774,7 @@ class vHeat3D(nn.Module):
 class S2VHeat3D(nn.Module):
     """3D vHeat的S2VNet兼容版本"""
 
-    def __init__(self, band, num_classes, patch_size):
+    def __init__(self, band, num_classes, patch_size, use_bottleneck=True, bottleneck_ratio=0.25):
         super().__init__()
         self.backbone = vHeat3D(
             in_chans=1,  # 高光谱作为3D输入
@@ -720,7 +787,10 @@ class S2VHeat3D(nn.Module):
             mlp_ratio=4.0,
             drop_path_rate=0.1,
             layer_scale=1e-6,
-            use_checkpoint=False
+            use_checkpoint=False,
+            # 启用瓶颈
+            use_bottleneck=use_bottleneck,
+            bottleneck_ratio=bottleneck_ratio,
         )
 
     def forward(self, x, output_abu=False):
