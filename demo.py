@@ -6,7 +6,7 @@ import torch.backends.cudnn as cudnn
 from scipy.io import savemat
 from torch import optim
 from s2vnet_model import S2VNet
-from vheat3d_model import S2VHeat3D
+from vheat3d_model import S2VHeat3D, Heat3D_Pipeline
 from utils import AvgrageMeter, accuracy, output_metric, NonZeroClipper, print_args
 from dataset import prepare_dataset
 import numpy as np
@@ -24,7 +24,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet', 'vheat3d'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet', 'vheat3d','Heat3D_Pipeline'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -179,6 +179,10 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
             # 🆕 vheat3d 只需要分类损失
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
+        elif args.model_name == 'Heat3D_Pipeline':
+            # 只需要分类损失
+            batch_pred = model(batch_data)
+            loss = criterion(batch_pred, batch_target)
         else:
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
@@ -217,6 +221,9 @@ def valid_epoch(model, valid_loader, criterion, optimizer, device):
         elif args.model_name == 'vheat3d':
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
+        elif args.model_name == 'Heat3D_Pipeline':
+            batch_pred = model(batch_data)
+            loss = criterion(batch_pred, batch_target)
         else:
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
@@ -243,6 +250,8 @@ def test_epoch(model, test_loader, device):
         if args.model_name == 's2vnet':
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, _, _ = model(batch_data)
         elif args.model_name == 'vheat3d':
+            batch_pred = model(batch_data)  # 🆕 vheat3d 直接输出分类结果
+        elif args.model_name == 'Heat3D_Pipeline':
             batch_pred = model(batch_data)  # 🆕 vheat3d 直接输出分类结果
         else:
             batch_pred = model(batch_data)
@@ -318,6 +327,8 @@ def main():
         model = S2VNet(band, num_classes, args.patches)
     elif args.model_name == 'vheat3d':
         model = S2VHeat3D(band, num_classes, args.patches)
+    elif args.model_name == 'Heat3D_Pipeline':
+        model = Heat3D_Pipeline(band, num_classes, args.patches)
     else:
         raise KeyError("{} model is unknown.".format(args.model_name))
     model = model.to(device)
@@ -397,6 +408,8 @@ def main():
                         _, _, batch_pred, _, _, _, _ = model(x_tensor)
                     elif args.model_name == 'vheat3d':
                         batch_pred = model(x_tensor)  # 🆕 vheat3d 直接输出分类结果
+                    elif args.model_name == 'Heat3D_Pipeline':
+                        batch_pred = model(x_tensor)  # 直接输出分类结果
                     else:
                         batch_pred = model(x_tensor)
 

@@ -11,7 +11,67 @@ from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
+# ---------- 谱降维模块 ----------
+class LearnableSpectralReducer(nn.Module):
+    """
+    Learnable spectral reducer using a pointwise Conv1d over the spectral dimension.
+    Input: (B, H, W, C)  or (B, C, H, W)
+    Output: (B, S_red, H, W)
+    """
+    def __init__(self, in_bands:int, out_bands:int, use_bias:bool=True):
+        super().__init__()
+        self.in_bands = in_bands
+        self.out_bands = out_bands
+        # Conv1d that maps spectral channels -> reduced spectral channels.
+        # Will be applied on (B, in_bands, H*W) via kernel_size=1
+        self.conv1d = nn.Conv1d(in_channels=in_bands, out_channels=out_bands, kernel_size=1, bias=use_bias)
+        # optional small BN + activation (helps stability)
+        self.bn = nn.BatchNorm2d(out_bands)
 
+    def forward(self, x):
+        # Accept (B, H, W, C) or (B, C, H, W)
+        if x.dim() == 4:  # (B, H, W, C)
+            B, H, W, C = x.shape
+            assert C == self.in_bands, f"in_bands mismatch: {C} vs {self.in_bands}"
+            x = x.permute(0, 3, 1, 2).contiguous()  # -> (B, C, H, W)
+        elif x.dim() == 4 and x.shape[1] == self.in_bands:
+            pass
+        elif x.dim() == 3:
+            raise ValueError("unexpected 3D input")
+        # now x is (B, C, H, W)
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, -1)          # (B, C, N) where N=H*W
+        y = self.conv1d(x_flat)            # (B, S_red, N)
+        y = y.view(B, self.out_bands, H, W) # (B, S_red, H, W)
+        # optional BN+act (we keep channel as 'spectral channels', so use BN2d)
+        y = self.bn(y)
+        return y  # (B, S_red, H, W)
+
+class PCASpectralReducer(nn.Module):
+    """
+    PCA-based reducer: offline compute projection matrix P (S_red x in_bands),
+    then apply linear projection: y = P @ x_spectral at every pixel.
+    Provide P as torch.tensor (S_red, in_bands).
+    """
+    def __init__(self, P:torch.Tensor):
+        super().__init__()
+        # P should be (S_red, in_bands)
+        assert P.ndim == 2
+        self.register_buffer("P", P.float())
+
+    def forward(self, x):
+        # x: (B, H, W, C) -> -> (B, S_red, H, W)
+        if x.dim() == 4:
+            B, H, W, C = x.shape
+            x_perm = x.permute(0, 3, 1, 2).contiguous()  # (B, C, H, W)
+        else:
+            raise ValueError("PCASpectralReducer expects (B,H,W,C) input.")
+        B, C, H, W = x_perm.shape
+        x_flat = x_perm.view(B, C, -1)  # (B, C, N)
+        # P (S_red, C) -> do batch matmul: y = P @ x_flat  => (B, S_red, N)
+        y = torch.einsum("sc, bcn -> bsn", self.P, x_flat)
+        y = y.view(B, self.P.shape[0], H, W)
+        return y  # (B, S_red, H, W)
 
 class LayerNorm3d(nn.Module):
     """3D LayerNorm that always returns channels-first ordering: (B, C, S, H, W).
@@ -806,6 +866,132 @@ class S2VHeat3D(nn.Module):
 
         logits = self.backbone(x)
         return logits
+
+
+
+class Heat3D_Pipeline(nn.Module):
+    """
+    (B, H, W, S) 或 (B, S, H, W) ->
+      1) 光谱降维 (S -> S')
+      2) Heat3D 堆叠 (首层 1->hidden_dim，后续 hidden_dim->hidden_dim)
+      3) 频谱池化 -> 2D Head -> logits
+    """
+    def __init__(self,
+                 band: int,
+                 num_classes: int,
+                 patches: int,
+                 reduced_bands: int = 24,
+                 heat_hidden_dim: int = 64,
+                 n_heat_layers: int = 2,
+                 head_channels: int = 128,
+                 reducer_type: str = "learnable",
+                 pca_P: Optional[torch.Tensor] = None,
+                 use_checkpoint: bool = False,
+                 freq_pool: str = "avgmax"):
+        super().__init__()
+        self.band = band
+        self.num_classes = num_classes
+        self.patches = patches
+        self.reduced_bands = reduced_bands
+        self.use_checkpoint = use_checkpoint
+        self.freq_pool = freq_pool
+
+        # 1) 光谱降维器：其实现期望 (B, H, W, S)
+        if reducer_type == "learnable":
+            self.reducer = LearnableSpectralReducer(in_bands=band, out_bands=reduced_bands)
+        elif reducer_type == "pca":
+            assert pca_P is not None and isinstance(pca_P, torch.Tensor), "pca_P 不能为空"
+            self.reducer = PCASpectralReducer(pca_P)
+        else:
+            raise ValueError(f"未知 reducer_type: {reducer_type}")
+
+        # 2) Heat3D 堆叠
+        modules = []
+        for i in range(n_heat_layers):
+            in_dim = 1 if i == 0 else heat_hidden_dim  # 首层1通道，后续维持hidden_dim
+            modules.append(Heat3D(dim=in_dim, hidden_dim=heat_hidden_dim))
+        self.heat_modules = nn.ModuleList(modules)
+        self.post_norms = nn.ModuleList([LayerNorm3d(heat_hidden_dim) for _ in range(n_heat_layers)])
+
+        # 3) 频率融合与分类头
+        self.spectral_fusion = nn.Conv3d(
+            in_channels=heat_hidden_dim, out_channels=head_channels,
+            kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=True
+        )
+        out2d_channels = head_channels * (2 if freq_pool == "avgmax" else 1)
+        self.head = nn.Sequential(
+            nn.Conv2d(out2d_channels, head_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(head_channels),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(head_channels, num_classes)
+        )
+
+    @staticmethod
+    def _to_channels_last_hw_s(x: torch.Tensor, band: int) -> torch.Tensor:
+        """
+        接受 (B, H, W, S) 或 (B, S, H, W)，输出统一为 (B, H, W, S)
+        """
+        if x.dim() != 4:
+            raise ValueError(f"期望 4D 输入, 得到 {x.shape}")
+        B, a, b, c = x.shape
+        if c == band:
+            return x.contiguous()                   # (B, H, W, S)
+        if a == band:
+            return x.permute(0, 2, 3, 1).contiguous()  # (B, S, H, W)->(B, H, W, S)
+        raise ValueError(f"无法确定光谱维度, 输入形状 {x.shape}, band={band}")
+
+    def _spectral_pool(self, x3d: torch.Tensor) -> torch.Tensor:
+        """
+        x3d: (B, C, S', H, W) -> (B, C' , H, W)
+        """
+        if self.freq_pool == "avg":
+            return x3d.mean(dim=2)
+        if self.freq_pool == "max":
+            return x3d.max(dim=2)[0]
+        if self.freq_pool == "avgmax":
+            avg = x3d.mean(dim=2)
+            mx = x3d.max(dim=2)[0]
+            return torch.cat([avg, mx], dim=1)
+        raise ValueError(f"未知 freq_pool: {self.freq_pool}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 形状统一到 (B, H, W, S) 以匹配 reducer
+        x_cl = self._to_channels_last_hw_s(x, self.band)
+        B, H, W, S = x_cl.shape
+        if H != self.patches or W != self.patches:
+            raise AssertionError(f"patch 尺寸不匹配: {H}x{W} != {self.patches}")
+
+        # 光谱降维: 期望输出 (B, S_red, H, W)
+        x_red = self.reducer(x_cl)
+        if x_red.dim() != 4:
+            raise ValueError(f"reducer 输出应为 4D, 得到 {x_red.shape}")
+
+        # 统一到 3D 输入 (B, 1, S', H, W)
+        if x_red.shape[1] == self.reduced_bands:            # (B, S', H, W)
+            x3d = x_red.unsqueeze(1).contiguous()
+        elif x_red.shape[-1] == self.reduced_bands:         # (B, H, W, S')
+            x3d = x_red.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
+        else:
+            raise ValueError(f"无法确定 reducer 输出布局: {x_red.shape}, reduced_bands={self.reduced_bands}")
+
+        # Heat3D 堆叠：首层 1->hidden_dim，其后 hidden_dim->hidden_dim
+        for module, norm in zip(self.heat_modules, self.post_norms):
+            if self.use_checkpoint:
+                x3d = checkpoint.checkpoint(module, x3d, None)
+            else:
+                x3d = module(x3d, None)
+            x3d = norm(x3d)  # (B, hidden_dim, S, H, W)
+
+        # 频率融合 -> 2D Head
+        x3d = self.spectral_fusion(x3d)  # (B, head_channels, S, H, W)
+        x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)
+        logits = self.head(x2d)          # (B, num_classes)
+        return logits
+
+
+
 
 
 if __name__ == "__main__":
