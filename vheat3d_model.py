@@ -369,6 +369,12 @@ class Heat3D(nn.Module):
                         fe = fe.reshape(1, -1)[:, :self.hidden_dim]
                 # 现在 fe 应为 (1, C)
                 k_all = self.to_k(fe)  # expected (1, 3C) or (3C,)
+
+                # ---- 防 NaN / 极端值：对 k_all 做 nan_to_num + clamp ----
+                k_all = torch.nan_to_num(k_all, nan=0.0, posinf=10.0, neginf=0.0)
+                # k>=0 的设定下，主要限制上界；若后续需要可放宽
+                k_all = torch.clamp(k_all, 0.0, 10.0)
+
                 # 规范 k_all 到 1D 长向量 (3C,)
                 if k_all.dim() == 2 and k_all.shape[0] == 1:
                     k_all = k_all.squeeze(0)
@@ -381,6 +387,7 @@ class Heat3D(nn.Module):
                 kx = kx.reshape(-1)
                 ky = ky.reshape(-1)
                 ks = ks.reshape(-1)
+
         # alpha bases: self._alpha_h shape (H,), self._alpha_w (W,), self._alpha_s (S,)
         # create exponentials with shapes broadcastable to (B,C,S,H,W):
         # kx_exp: (1, C, 1, H, 1)
@@ -649,10 +656,7 @@ class HeatBlock3D(nn.Module):
                     normed_compressed = normed
                 op_out = self.op(normed_compressed, freq_embed)
                 op_out = ensure_op_out_matches(op_out, target_spatial, self.bottleneck_dim if self.use_bottleneck else hidden)
-                # 瓶颈扩展
-                if self.use_bottleneck:
-                    op_out = self.bottleneck_expand(op_out)
-                    op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
+                op_out = ensure_op_out_matches(op_out, target_spatial, hidden)
                 x_cf = x_cf + self.drop_path(self.gamma1.view(1,-1,1,1,1) * op_out)
                 if self.mlp_branch:
                     norm2_x = self.norm2(x_cf)
@@ -887,7 +891,8 @@ class Heat3D_Pipeline(nn.Module):
                  reducer_type: str = "learnable",
                  pca_P: Optional[torch.Tensor] = None,
                  use_checkpoint: bool = False,
-                 freq_pool: str = "avgmax"):
+                 freq_pool: str = "avgmax",
+                 use_post_norm: bool = True):
         super().__init__()
         self.band = band
         self.num_classes = num_classes
@@ -895,12 +900,20 @@ class Heat3D_Pipeline(nn.Module):
         self.reduced_bands = reduced_bands
         self.use_checkpoint = use_checkpoint
         self.freq_pool = freq_pool
+        self.use_post_norm = use_post_norm
 
         # 1) 光谱降维器：其实现期望 (B, H, W, S)
         if reducer_type == "learnable":
             self.reducer = LearnableSpectralReducer(in_bands=band, out_bands=reduced_bands)
         elif reducer_type == "pca":
             assert pca_P is not None and isinstance(pca_P, torch.Tensor), "pca_P 不能为空"
+            assert pca_P.ndim == 2, f"pca_P 期望 2D, 得到 {pca_P.shape}"
+            assert pca_P.shape[0] == reduced_bands, (
+                f"PCA 投影矩阵第一维({pca_P.shape[0]})应为 reduced_bands={reduced_bands}"
+            )
+            assert pca_P.shape[1] == band, (
+                f"PCA 投影矩阵第二维({pca_P.shape[1]})应为 band={band}"
+            )
             self.reducer = PCASpectralReducer(pca_P)
         else:
             raise ValueError(f"未知 reducer_type: {reducer_type}")
@@ -911,14 +924,25 @@ class Heat3D_Pipeline(nn.Module):
             in_dim = 1 if i == 0 else heat_hidden_dim  # 首层1通道，后续维持hidden_dim
             modules.append(Heat3D(dim=in_dim, hidden_dim=heat_hidden_dim))
         self.heat_modules = nn.ModuleList(modules)
-        self.post_norms = nn.ModuleList([LayerNorm3d(heat_hidden_dim) for _ in range(n_heat_layers)])
+
+        # post_norm 改为可选
+        if self.use_post_norm:
+            self.post_norms = nn.ModuleList([LayerNorm3d(heat_hidden_dim) for _ in range(n_heat_layers)])
+        else:
+            self.post_norms = nn.ModuleList([nn.Identity() for _ in range(n_heat_layers)])
 
         # 3) 频率融合与分类头
         self.spectral_fusion = nn.Conv3d(
             in_channels=heat_hidden_dim, out_channels=head_channels,
             kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=True
         )
-        out2d_channels = head_channels * (2 if freq_pool == "avgmax" else 1)
+
+        # 恢复：avgmax 只做简单拼接，不加 1x1 conv
+        if freq_pool == "avgmax":
+            out2d_channels = head_channels * 2
+        else:
+            out2d_channels = head_channels
+
         self.head = nn.Sequential(
             nn.Conv2d(out2d_channels, head_channels, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(head_channels),
@@ -931,20 +955,45 @@ class Heat3D_Pipeline(nn.Module):
     @staticmethod
     def _to_channels_last_hw_s(x: torch.Tensor, band: int) -> torch.Tensor:
         """
-        接受 (B, H, W, S) 或 (B, S, H, W)，输出统一为 (B, H, W, S)
+        接受 (B, H, W, S) / (B, S, H, W) / (B, W, H, S) 等，输出统一为 (B, H, W, S)
+        更健壮地自动检测哪个维度是光谱维 (== band)。
         """
         if x.dim() != 4:
             raise ValueError(f"期望 4D 输入, 得到 {x.shape}")
-        B, a, b, c = x.shape
-        if c == band:
-            return x.contiguous()                   # (B, H, W, S)
-        if a == band:
-            return x.permute(0, 2, 3, 1).contiguous()  # (B, S, H, W)->(B, H, W, S)
-        raise ValueError(f"无法确定光谱维度, 输入形状 {x.shape}, band={band}")
+
+        B, d1, d2, d3 = x.shape
+        dims = [d1, d2, d3]
+
+        # 找出与 band 相等的维度索引
+        spectral_candidates = [i for i, d in enumerate(dims) if d == band]
+        if len(spectral_candidates) == 0:
+            raise ValueError(f"无法在 {x.shape} 中找到等于 band={band} 的光谱维")
+        if len(spectral_candidates) > 1:
+            raise ValueError(f"输入形状 {x.shape} 中有多个维度等于 band={band}, "
+                             f"无法唯一确定光谱维, candidates={spectral_candidates}")
+
+        s_idx = spectral_candidates[0]  # 0,1,2 分别对应原来的 dim1,2,3
+
+        # 根据 s_idx 构造到 (B,H,W,S) 的 permute
+        if s_idx == 2:
+            # (B, H, W, S) 已经是目标格式
+            return x.contiguous()
+        elif s_idx == 0:
+            # (B, S, H, W) -> (B, H, W, S)
+            return x.permute(0, 2, 3, 1).contiguous()
+        elif s_idx == 1:
+            # (B, H, S, W) 或 (B, W, S, H)，需要再判断剩余两个维度
+            remaining = [i for i in range(3) if i != s_idx]
+            h_idx, w_idx = remaining
+            # 默认 (B, H, S, W) -> (B, H, W, S)
+            return x.permute(0, h_idx + 1, w_idx + 1, s_idx + 1).contiguous()
+        else:
+            # 不应该到这里
+            raise RuntimeError(f"意外的 spectral index {s_idx} for shape {x.shape}")
 
     def _spectral_pool(self, x3d: torch.Tensor) -> torch.Tensor:
         """
-        x3d: (B, C, S', H, W) -> (B, C' , H, W)
+        x3d: (B, C, S', H, W) -> (B, C2d , H, W)
         """
         if self.freq_pool == "avg":
             return x3d.mean(dim=2)
@@ -968,13 +1017,23 @@ class Heat3D_Pipeline(nn.Module):
         if x_red.dim() != 4:
             raise ValueError(f"reducer 输出应为 4D, 得到 {x_red.shape}")
 
-        # 统一到 3D 输入 (B, 1, S', H, W)
-        if x_red.shape[1] == self.reduced_bands:            # (B, S', H, W)
-            x3d = x_red.unsqueeze(1).contiguous()
-        elif x_red.shape[-1] == self.reduced_bands:         # (B, H, W, S')
-            x3d = x_red.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
+        # ---- 检查 reducer 输出的光谱维是否与 reduced_bands 一致 ----
+        # 允许两种主布置：通道在 dim=1 或 dim=-1，其余情况报错
+        if x_red.shape[1] == self.reduced_bands:
+            layout = "CHW"  # (B, S', H, W)
+        elif x_red.shape[-1] == self.reduced_bands:
+            layout = "HWCh"  # (B, H, W, S')
         else:
-            raise ValueError(f"无法确定 reducer 输出布局: {x_red.shape}, reduced_bands={self.reduced_bands}")
+            raise AssertionError(
+                f"reducer 输出光谱维与 reduced_bands 不一致: 输出 {x_red.shape}, "
+                f"reduced_bands={self.reduced_bands}"
+            )
+
+        # 统一到 3D 输入 (B, 1, S', H, W)
+        if layout == "CHW":            # (B, S', H, W)
+            x3d = x_red.unsqueeze(1).contiguous()
+        else:                           # (B, H, W, S')
+            x3d = x_red.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
 
         # Heat3D 堆叠：首层 1->hidden_dim，其后 hidden_dim->hidden_dim
         for module, norm in zip(self.heat_modules, self.post_norms):
@@ -982,11 +1041,12 @@ class Heat3D_Pipeline(nn.Module):
                 x3d = checkpoint.checkpoint(module, x3d, None)
             else:
                 x3d = module(x3d, None)
+            # post_norm 可选
             x3d = norm(x3d)  # (B, hidden_dim, S, H, W)
 
         # 频率融合 -> 2D Head
         x3d = self.spectral_fusion(x3d)  # (B, head_channels, S, H, W)
-        x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)
+        x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)，内部会做 freq_fuse
         logits = self.head(x2d)          # (B, num_classes)
         return logits
 

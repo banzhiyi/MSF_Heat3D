@@ -371,7 +371,7 @@ def main():
         print(f"✅ 自动加载最新权重: {weight_path}")
         if not os.path.exists(weight_path):
             # 若找不到best模型，可改成你之前保存的具体文件名
-            weight_path = 'results/master/Berlin/Berlin_s2vnet_p7_78.53_epoch320_2025-10-30-1806.pkl'
+            weight_path = 'results/vheat3d-未优化/Indian/Indian_Heat3D_Pipeline_p7_95.8_epoch125_2025-11-21-2051.pkl'
         print(f"Loading weights from: {weight_path}")
         model.load_state_dict(torch.load(weight_path, map_location=device))
 
