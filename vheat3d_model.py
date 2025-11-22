@@ -200,7 +200,8 @@ class Heat3D(nn.Module):
     Neumann 边界 => 3D DCT/IDCT; 频域指数衰减（各向异性 kx, ky, ks）
     """
 
-    def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96, k_learnable=True, **kwargs):
+    def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96,
+                 k_learnable=True, use_local3d: bool = True, light_in_proj: bool = False, **kwargs):
         super().__init__()
         self.res = res
         self.hidden_dim = hidden_dim
@@ -208,7 +209,37 @@ class Heat3D(nn.Module):
         self.infer_mode = infer_mode
 
         # 3D 局部前处理
-        self.local3d = nn.Conv3d(dim, hidden_dim, kernel_size=3, padding=1, bias=True)
+        #self.local3d = nn.Conv3d(dim, hidden_dim, kernel_size=3, padding=1, bias=True)
+        # 3D 局部前处理 / 轻量前处理
+        if use_local3d:
+            # 原始 3x3x3 local3d
+            self.local3d = nn.Conv3d(
+                dim,
+                hidden_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=True,
+            )
+        else:
+            if light_in_proj:
+                # 轻量 1x1x1 卷积，仅做通道映射，不引入局部空间卷积
+                self.local3d = nn.Conv3d(
+                    dim,
+                    hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    bias=True,
+                )
+            else:
+                # 退化为恒等映射（要求 dim == hidden_dim）
+                if dim != hidden_dim:
+                    raise ValueError(
+                        f"Heat3D: use_local3d=False 且 light_in_proj=False 时, "
+                        f"要求 dim == hidden_dim, 得到 dim={dim}, hidden_dim={hidden_dim}"
+                    )
+                self.local3d = nn.Identity()
 
         # 产生两路：HCO 主分支 + 门控分支
         self.linear = nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
@@ -918,11 +949,30 @@ class Heat3D_Pipeline(nn.Module):
         else:
             raise ValueError(f"未知 reducer_type: {reducer_type}")
 
-        # 2) Heat3D 堆叠
+        # 2) Heat3D 堆叠：首层保留 3x3x3 local3d，后续层可改为轻量 1x1x1 卷积
         modules = []
         for i in range(n_heat_layers):
-            in_dim = 1 if i == 0 else heat_hidden_dim  # 首层1通道，后续维持hidden_dim
-            modules.append(Heat3D(dim=in_dim, hidden_dim=heat_hidden_dim))
+            in_dim = 1 if i == 0 else heat_hidden_dim
+            if i == 0:
+                # 第一层：保持原始 local3d
+                modules.append(
+                    Heat3D(
+                        dim=in_dim,
+                        hidden_dim=heat_hidden_dim,
+                        use_local3d=True,
+                        light_in_proj=False,
+                    )
+                )
+            else:
+                # 第二层及之后：关闭 3x3x3，改用 1x1x1 轻量卷积
+                modules.append(
+                    Heat3D(
+                        dim=in_dim,
+                        hidden_dim=heat_hidden_dim,
+                        use_local3d=False,
+                        light_in_proj=True,
+                    )
+                )
         self.heat_modules = nn.ModuleList(modules)
 
         # post_norm 改为可选
