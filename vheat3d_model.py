@@ -201,13 +201,14 @@ class Heat3D(nn.Module):
     """
 
     def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96,
-                 k_learnable=True, use_local3d: bool = True, light_in_proj: bool = False, **kwargs):
+                 k_learnable=True, use_local3d: bool = True,
+                 light_in_proj: bool = False, use_sobel_mod: bool = True,**kwargs):
         super().__init__()
         self.res = res
         self.hidden_dim = hidden_dim
         self.input_dim = dim  # 新增：保存输入维度
         self.infer_mode = infer_mode
-
+        self.use_sobel_mod = use_sobel_mod
         # 3D 局部前处理
         #self.local3d = nn.Conv3d(dim, hidden_dim, kernel_size=3, padding=1, bias=True)
         # 3D 局部前处理 / 轻量前处理
@@ -269,6 +270,41 @@ class Heat3D(nn.Module):
         self.register_buffer("ky_exp", None, persistent=False)
         self.register_buffer("ks_exp", None, persistent=False)
 
+        # ------------------ 温和版 Sobel Edge 调制 ------------------
+        if self.use_sobel_mod:
+            # 使用简单的 2D Sobel (在 H/W 上)，对每个通道共享核
+            sobel_kernel_x = torch.tensor(
+                [[-1., 0., 1.],
+                 [-2., 0., 2.],
+                 [-1., 0., 1.]]
+            ).view(1, 1, 3, 3)
+            sobel_kernel_y = torch.tensor(
+                [[-1., -2., -1.],
+                 [0., 0., 0.],
+                 [1., 2., 1.]]
+            ).view(1, 1, 3, 3)
+
+            # 注册为 buffer，推理期不参与梯度
+            self.register_buffer("sobel_kernel_x", sobel_kernel_x, persistent=False)
+            self.register_buffer("sobel_kernel_y", sobel_kernel_y, persistent=False)
+
+            # 将全局 edge 统计映射到每个通道的调制系数
+            # 输入: (B,2) -> 输出: (B,2*hidden_dim) 再拆成 edge_mod_h, edge_mod_w
+            self.edge_mlp = nn.Sequential(
+                nn.Linear(2, hidden_dim, bias=True),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2 * hidden_dim, bias=True),
+                nn.Tanh(),  # 输出范围约在 [-1,1]，后面再乘以小系数
+            )
+            # 控制调制强度的可学习缩放因子（初始化很小）
+            self.edge_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
+        else:
+            # 关闭 Sobel 调制时，避免属性不存在
+            self.register_buffer("sobel_kernel_x", None, persistent=False)
+            self.register_buffer("sobel_kernel_y", None, persistent=False)
+            self.edge_mlp = None
+            self.edge_alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32), requires_grad=False)
+
     @staticmethod
     def _cos_map(N, device, dtype):
         # 正交化 DCT-II 基: (n, x)
@@ -329,6 +365,9 @@ class Heat3D(nn.Module):
         B, C_in, S, H, W = x.shape
         device, dtype = x.device, x.dtype
         C = self.hidden_dim
+
+        # 保存一份原始输入用于 Sobel 边缘估计
+        x_in = x  # (B, C_in, S, H, W)
 
         # 1) local conv -> (B, C, S, H, W)
         x = self.local3d(x)  # (B, hidden_dim, S, H, W)
@@ -419,25 +458,77 @@ class Heat3D(nn.Module):
                 ky = ky.reshape(-1)
                 ks = ks.reshape(-1)
 
-        # alpha bases: self._alpha_h shape (H,), self._alpha_w (W,), self._alpha_s (S,)
-        # create exponentials with shapes broadcastable to (B,C,S,H,W):
-        # kx_exp: (1, C, 1, H, 1)
-        # ky_exp: (1, C, 1, 1, W)
-        # ks_exp: (1, C, S, 1, 1)
-        kx_v = kx.view(1, C, 1, 1, 1)  # (1,C,1,1,1)
-        ky_v = ky.view(1, C, 1, 1, 1)
-        ks_v = ks.view(1, C, 1, 1, 1)
-        alpha_h = self._alpha_h.to(device=device, dtype=dtype).view(1, 1, 1, H, 1)  # (1,1,1,H,1)
-        alpha_w = self._alpha_w.to(device=device, dtype=dtype).view(1, 1, 1, 1, W)  # (1,1,1,1,W)
-        alpha_s = self._alpha_s.to(device=device, dtype=dtype).view(1, 1, S, 1, 1)  # (1,1,S,1,1)
+            # ------------------ Sobel Edge 调制 kx, ky（温和版，可关闭） ------------------
+            if self.use_sobel_mod and (self.edge_mlp is not None):
+                # 只在训练/非推理模式下启用调制；也可以根据需要总是开启
+                with torch.no_grad():
+                    # 使用输入 x_in 估计空间边缘强度
+                    # 先把 S 维合并到 batch，转为 4D: (B*S, C_in, H, W)
+                    x_edge = x_in.permute(0, 2, 1, 3, 4).contiguous()  # (B,S,C_in,H,W)
+                    x_edge = x_edge.view(B * S, C_in, H, W)
 
-        # raise to per-channel powers -> shapes:
-        kx_exp = (alpha_h ** kx_v)  # (1,C,1,H,1)
-        ky_exp = (alpha_w ** ky_v)  # (1,C,1,1,W)
-        ks_exp = (alpha_s ** ks_v)  # (1,C,S,1,1)
+                    # 对每个通道复用同一组 Sobel 核：用分组卷积实现
+                    kx_sobel = self.sobel_kernel_x.to(device=device, dtype=dtype).expand(C_in, 1, 3, 3)
+                    ky_sobel = self.sobel_kernel_y.to(device=device, dtype=dtype).expand(C_in, 1, 3, 3)
 
-        # Multiply (broadcasts over batch)
-        x = x * kx_exp * ky_exp * ks_exp  # (B,C,S,H,W)
+                    grad_x = F.conv2d(x_edge, kx_sobel, padding=1, groups=C_in)  # (B*S, C_in, H, W)
+                    grad_y = F.conv2d(x_edge, ky_sobel, padding=1, groups=C_in)  # (B*S, C_in, H, W)
+
+                    # 梯度幅值
+                    grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)  # (B*S, C_in, H, W)
+
+                    # 在 H/W 上做平均，再在 C_in 上平均，得到每个样本每个谱片的整体边缘强度
+                    grad_mean_spatial = grad_mag.mean(dim=(2, 3))  # (B*S, C_in)
+                    grad_mean = grad_mean_spatial.mean(dim=1)  # (B*S,)
+
+                    # 再对 S 聚合得到每个 batch 样本一个标量
+                    grad_mean = grad_mean.view(B, S).mean(dim=1)  # (B,)
+
+                    # 同理也可以对 grad_x, grad_y 分别做 global mean，得到方向性信息
+                    gx_mean = grad_x.mean(dim=(2, 3))  # (B*S, C_in)
+                    gy_mean = grad_y.mean(dim=(2, 3))  # (B*S, C_in)
+                    gx_mean = gx_mean.mean(dim=1).view(B, S).mean(dim=1)  # (B,)
+                    gy_mean = gy_mean.mean(dim=1).view(B, S).mean(dim=1)  # (B,)
+
+                    # 组合两个标量特征
+                    edge_feat_1 = grad_mean
+                    edge_feat_2 = (gx_mean.abs() - gy_mean.abs())
+                    edge_global = torch.stack([edge_feat_1, edge_feat_2], dim=-1)  # (B,2)
+
+                # 通过一个小 MLP 将全局 edge 描述映射到每个通道的调制系数
+                edge_mod = self.edge_mlp(edge_global)  # (B, 2*C)
+                edge_mod = edge_mod.mean(dim=0)  # (2*C,)
+                edge_mod_h, edge_mod_w = torch.chunk(edge_mod, 2, dim=0)  # 各是 (C,)
+
+                # 使用 tanh + 小的 edge_alpha 做温和调制
+                kx_eff = kx * (1.0 + self.edge_alpha * edge_mod_h)
+                ky_eff = ky * (1.0 + self.edge_alpha * edge_mod_w)
+                ks_eff = ks  # 先不对谱向做调制
+
+                # 防止出现极端或负值，再次裁剪
+                kx_eff = torch.clamp(kx_eff, 0.0, 10.0)
+                ky_eff = torch.clamp(ky_eff, 0.0, 10.0)
+                ks_eff = torch.clamp(ks_eff, 0.0, 10.0)
+            else:
+                # 完全关闭 Sobel 调制：直接使用原始 kx, ky, ks
+                kx_eff = torch.clamp(kx, 0.0, 10.0)
+                ky_eff = torch.clamp(ky, 0.0, 10.0)
+                ks_eff = torch.clamp(ks, 0.0, 10.0)
+
+            # ------------------ 使用 kx_eff, ky_eff, ks_eff 构造衰减因子 ------------------
+            kx_v = kx_eff.view(1, C, 1, 1, 1)
+            ky_v = ky_eff.view(1, C, 1, 1, 1)
+            ks_v = ks_eff.view(1, C, 1, 1, 1)
+
+        alpha_h = self._alpha_h.to(device=device, dtype=dtype).view(1, 1, 1, H, 1)
+        alpha_w = self._alpha_w.to(device=device, dtype=dtype).view(1, 1, 1, 1, W)
+        alpha_s = self._alpha_s.to(device=device, dtype=dtype).view(1, 1, S, 1, 1)
+
+        kx_exp = (alpha_h ** kx_v)
+        ky_exp = (alpha_w ** ky_v)
+        ks_exp = (alpha_s ** ks_v)
+
+        x = x * kx_exp * ky_exp * ks_exp
 
         # ---------- Inverse DCT (IDCT) along W, H, S using W_.T reversed order ----------
         # inverse W
@@ -961,6 +1052,7 @@ class Heat3D_Pipeline(nn.Module):
                         hidden_dim=heat_hidden_dim,
                         use_local3d=True,
                         light_in_proj=False,
+                        use_sobel_mod=False,  # 默认关闭
                     )
                 )
             else:
@@ -969,8 +1061,9 @@ class Heat3D_Pipeline(nn.Module):
                     Heat3D(
                         dim=in_dim,
                         hidden_dim=heat_hidden_dim,
-                        use_local3d=False,
-                        light_in_proj=True,
+                        use_local3d=True,
+                        light_in_proj=False,
+                        use_sobel_mod=False,  # 默认关闭
                     )
                 )
         self.heat_modules = nn.ModuleList(modules)
