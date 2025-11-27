@@ -7,8 +7,13 @@ import h5py
 
 def prepare_dataset(args, samples_type='ratio'):
     # prepare data
-    if args.dataset == 'Indian':
-        data = loadmat('./data/IndianPine.mat')
+    if args.dataset in ['Indian', 'Pavia', 'Houston']:
+        mat_map = {
+            'Indian': './data/IndianPine.mat',
+            'Pavia': './data/Pavia.mat',
+            'Houston': './data/Houston.mat'
+        }
+        data = loadmat(mat_map[args.dataset])
         TR = data['TR']
         TE = data['TE']
         input = data['input']
@@ -26,106 +31,13 @@ def prepare_dataset(args, samples_type='ratio'):
         TR = data_train['TrainImage']
         TE = data_test['TestImage']
         input = data['data_HS_LR']
-    elif args.dataset == 'Houston':  # 🆕 修复 Houston 数据集加载逻辑
-        if samples_type == 'train':
-            # 🎯 训练阶段：加载 Houston 2013，并分割为训练集和验证集
-            data_file = './data/Houston/Houston13.mat'
-            label_file = './data/Houston/Houston13_7gt.mat'
-
-            print(f"训练阶段：加载 Houston 2013")
-            with h5py.File(data_file, 'r') as f:
-                input = f['ori_data'][()]  # (48, 954, 210)
-            with h5py.File(label_file, 'r') as f:
-                labels = f['map'][()]  # (954, 210)
-
-            # 调整数据维度
-            input = np.transpose(input, (1, 2, 0))  # (954, 210, 48)
-            labels = labels.astype(np.int32)
-
-            print(f"Houston 2013 数据形状: {input.shape}")
-            print(f"Houston 2013 标签形状: {labels.shape}")
-            print(f"标签唯一值: {np.unique(labels)}")
-
-            # 🎯 关键：将 Houston 2013 分割为训练集和验证集
-            TR = np.zeros_like(labels, dtype=np.int32)
-            TE = np.zeros_like(labels, dtype=np.int32)
-
-            # 获取所有有标签的像素位置
-            labeled_positions = np.argwhere(labels > 0)
-            total_labeled = len(labeled_positions)
-
-            # 随机分割：80% 训练，20% 验证
-            np.random.shuffle(labeled_positions)
-            split_idx = int(0.8 * total_labeled)
-
-            train_positions = labeled_positions[:split_idx]
-            val_positions = labeled_positions[split_idx:]
-
-            # 分配训练集和验证集标签
-            for pos in train_positions:
-                i, j = pos
-                TR[i, j] = labels[i, j]
-
-            for pos in val_positions:
-                i, j = pos
-                TE[i, j] = labels[i, j]
-
-            print(f"训练集样本数: {len(train_positions)}")
-            print(f"验证集样本数: {len(val_positions)}")
-            print(f"训练集标签分布: {np.unique(TR, return_counts=True)}")
-            print(f"验证集标签分布: {np.unique(TE, return_counts=True)}")
-
-        else:
-            # 🎯 测试阶段：加载 Houston 2018 作为测试集
-            data_file = './data/Houston/Houston18.mat'
-            label_file = './data/Houston/Houston18_7gt.mat'
-
-            print(f"测试阶段：加载 Houston 2018")
-            with h5py.File(data_file, 'r') as f:
-                input = f['ori_data'][()]  # (48, 954, 210)
-            with h5py.File(label_file, 'r') as f:
-                labels = f['map'][()]  # (954, 210)
-
-            # 调整数据维度
-            input = np.transpose(input, (1, 2, 0))  # (954, 210, 48)
-            labels = labels.astype(np.int32)
-
-            print(f"Houston 2018 数据形状: {input.shape}")
-            print(f"Houston 2018 标签形状: {labels.shape}")
-            print(f"标签唯一值: {np.unique(labels)}")
-
-            # 🎯 测试阶段：所有有标签像素作为测试集
-            TR = np.zeros_like(labels, dtype=np.int32)  # 训练集为空
-            TE = labels.copy()  # 所有标签作为测试集
-
-            test_samples = np.sum(TE > 0)
-            print(f"测试集样本数: {test_samples}")
-            print(f"测试集标签分布: {np.unique(TE, return_counts=True)}")
-
-            # 🎯 关键修复：在测试阶段，我们需要设置正确的 num_classes
-            # 虽然 TR 是空的，但我们应该根据 TE 的最大值来设置 num_classes
-            if np.max(TE) > 0:
-                num_classes_from_te = int(np.max(TE))
-            else:
-                num_classes_from_te = 7  # Houston 数据集有 7 个类别
-
-            print(f"测试阶段：根据测试集设置类别数 = {num_classes_from_te}")
     else:
         raise ValueError("Unknown dataset")
 
     label = TR + TE
-    #num_classes = np.max(TR)
-    # 🎯 修复：在 Houston 测试阶段特殊处理 num_classes
-    if args.dataset == 'Houston' and samples_type == 'test':
-        # 测试阶段：TR 是空的，我们需要根据 TE 来设置 num_classes
-        if np.max(TE) > 0:
-            num_classes = int(np.max(TE))
-        else:
-            num_classes = 7  # Houston 数据集默认有 7 个类别
-        print(f"Houston 测试阶段：设置类别数 = {num_classes}")
-    else:
-        # 其他情况正常计算
-        num_classes = int(np.max(TR)) if np.max(TR) > 0 else int(np.max(TE))
+    num_classes = int(max(np.max(TR), np.max(TE)))
+    if num_classes == 0:
+        raise ValueError(f"{args.dataset} 数据集中未找到有效类别标签。")
 
     print(f"数据集: {args.dataset}, 类别数: {num_classes}")
     print(f"TR 最大值: {np.max(TR)}, TE 最大值: {np.max(TE)}")
