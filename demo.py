@@ -314,7 +314,7 @@ def main():
     elif args.model_name == 'vheat3d':
         model = S2VHeat3D(band, num_classes, args.patches)
     elif args.model_name == 'Heat3D_Pipeline':
-        model = Heat3D_Pipeline(band, num_classes, args.patches)
+        model = Heat3D_Pipeline(band, num_classes, args.patches,)
     else:
         raise KeyError("{} model is unknown.".format(args.model_name))
     model = model.to(device)

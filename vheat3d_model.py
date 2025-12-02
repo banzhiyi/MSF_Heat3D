@@ -11,6 +11,141 @@ from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
+def dct_1d(x, dim=-1):
+    """
+    对指定维度做 1D DCT-II，实数变换，线性、无参数。
+    x: 任意形状 Tensor
+    """
+    N = x.size(dim)
+    # 使用 FFT 的实数部分近似 DCT，保持线性
+    # 这里采用一种常用 trick: 在 2N 上做 FFT，再取实部
+    x = torch.cat([x, x.flip(dims=[dim])], dim=dim)  # 对称扩展
+    X = torch.fft.rfft(x, dim=dim)
+    # 只取前 N 个频率分量
+    slices = [slice(None)] * x.dim()
+    slices[dim] = slice(0, N)
+    X = X[tuple(slices)].real
+    return X
+
+
+def idct_1d(X, dim=-1):
+    """
+    对指定维度做 1D 逆 DCT（对应上面的 dct_1d），保持线性。
+    X: 任意形状 Tensor，最后一维为频率长度 N
+    """
+    N = X.size(dim)
+    # 反向构造长度为 2N 的对称谱，然后用 irfft
+    zeros_shape = list(X.shape)
+    zeros_shape[dim] = 1
+    zeros_pad = X.new_zeros(zeros_shape)
+
+    # 拼出长度为 N+1 的 rfft 频谱（实数信号 rfft 长度为 N+1）
+    # 这里用一个简化近似：补 0，然后 irfft，再截断
+    X_rfft = torch.cat([X, zeros_pad], dim=dim)  # [ ..., N+1 ]
+    x_rec = torch.fft.irfft(X_rfft, n=2 * N, dim=dim)
+
+    # 取前 N 个样本作为近似的 idct 结果
+    slices = [slice(None)] * x_rec.dim()
+    slices[dim] = slice(0, N)
+    x_rec = x_rec[tuple(slices)]
+    return x_rec
+
+class SpectralFrequencyGating(nn.Module):
+    """
+    仅在谱维做 1D 频域建模的轻量门控模块。
+
+    预期输入/输出形状:
+    - 输入:  x \[B, C, H, W, D\] 或 \[B, C, D, H, W\]，通过 `spec_dim` 控制谱维位置。
+    - 输出: 同形状，乘上 \[B, C, 1, 1, D\] broadcast 的 sigmoid 门控。
+
+    流程:
+    1) H,W 上全局平均池化 -> x_mean \[B, C, D\]
+    2) D 维上 DCT -> X_freq \[B, C, D\]
+    3) 频域上 depthwise Conv1d -> X_freq_mod
+    4) IDCT 回时域 -> gate_spec \[B, C, D\]
+    5) sigmoid + broadcast -> x * gate
+    """
+    def __init__(self, channels, spec_length, spec_dim=-1, kernel_size=3, use_pointwise=True):
+        super(SpectralFrequencyGating, self).__init__()
+        self.channels = channels
+        self.spec_length = spec_length
+        self.spec_dim = spec_dim  # x 中谱维所在的维度索引
+
+        padding = kernel_size // 2
+
+        # 频域上的 depthwise Conv1d：每个通道一组频率响应
+        self.dw_conv = nn.Conv1d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=channels,
+            bias=True
+        )
+
+        # 可选: 一个 pointwise Conv1d，在频率维上做轻量 mixing
+        if use_pointwise:
+            self.pw_conv = nn.Conv1d(
+                in_channels=channels,
+                out_channels=channels,
+                kernel_size=1,
+                bias=True
+            )
+        else:
+            self.pw_conv = None
+
+    def forward(self, x):
+        """
+        x: 形状 \[B, C, ..., D, ...\]，其中谱维长度为 self.spec_length。
+        只对谱维做 gating，不改变 H,W 结构。
+        """
+        # 1) 把谱维交换到最后，方便 pooling 和 DCT
+        # 假设当前 spec_dim 位置是 self.spec_dim
+        if self.spec_dim != -1:
+            x = x.transpose(self.spec_dim, -1)  # 现在谱维在 -1
+
+        # 此时假设 x: [B, C, H, W, D] 或 [B, C, *, D]
+        B, C = x.shape[0], x.shape[1]
+        D = x.shape[-1]
+
+        # 2) 沿 H,W 做全局平均池化，只保留谱维 D
+        #    无论中间有几个空间维，统统平均掉，只保留 [B, C, D]
+        spatial_dims = list(range(2, x.dim() - 1))  # 排除 B,C,D 其余都视为空间维
+        if len(spatial_dims) > 0:
+            x_mean = x.mean(dim=spatial_dims, keepdim=False)  # [B, C, D]
+        else:
+            x_mean = x  # 已经没有空间维了
+
+        # 3) DCT: 频域变换（线性，无参数）
+        X_freq = dct_1d(x_mean, dim=-1)  # [B, C, D]
+
+        # 4) 在频域做 1D conv：先视 C 为通道，用 Conv1d 的 (N=C, L=D) 约定
+        #    Conv1d 期望输入 [B, C, L]，当前就是 [B, C, D]
+        X_mod = self.dw_conv(X_freq)  # [B, C, D]
+        if self.pw_conv is not None:
+            X_mod = self.pw_conv(X_mod)  # [B, C, D]
+
+        # 5) 逆 DCT 回谱域
+        gate_spec = idct_1d(X_mod, dim=-1)  # [B, C, D]
+
+        # 6) sigmoid 归一化，作为软门控
+        gate_spec = torch.sigmoid(gate_spec)  # [B, C, D]
+
+        # 7) 将 gate_spec broadcast 回原始 x 的形状
+        #    先恢复谱维为 -1，其它空间维通过 unsqueeze/broadcast
+        # 先扩展为 [B, C, 1, 1, D, ...] 与 x 匹配
+        # 构造一个形状列表 [B, C, 1, 1, ..., D]
+        while gate_spec.dim() < x.dim():
+            gate_spec = gate_spec.unsqueeze(-2)  # 在 D 前面不断插入 1 维度
+
+        # 现在 gate_spec 和 x 同维度数，最后一维都是 D，可以 broadcast
+        x = x * gate_spec
+
+        # 8) 如果一开始挪动过谱维位置，这里再挪回去
+        if self.spec_dim != -1:
+            x = x.transpose(self.spec_dim, -1)
+
+        return x
 # ---------- 谱降维模块 ----------
 class LearnableSpectralReducer(nn.Module):
     """
@@ -202,13 +337,13 @@ class Heat3D(nn.Module):
 
     def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96,
                  k_learnable=True, use_local3d: bool = True,
-                 light_in_proj: bool = False, use_sobel_mod: bool = True,**kwargs):
+                 light_in_proj: bool = False,
+                 **kwargs):
         super().__init__()
         self.res = res
         self.hidden_dim = hidden_dim
         self.input_dim = dim  # 新增：保存输入维度
         self.infer_mode = infer_mode
-        self.use_sobel_mod = use_sobel_mod
         # 3D 局部前处理
         #self.local3d = nn.Conv3d(dim, hidden_dim, kernel_size=3, padding=1, bias=True)
         # 3D 局部前处理 / 轻量前处理
@@ -270,41 +405,6 @@ class Heat3D(nn.Module):
         self.register_buffer("ky_exp", None, persistent=False)
         self.register_buffer("ks_exp", None, persistent=False)
 
-        # ------------------ 温和版 Sobel Edge 调制 ------------------
-        if self.use_sobel_mod:
-            # 使用简单的 2D Sobel (在 H/W 上)，对每个通道共享核
-            sobel_kernel_x = torch.tensor(
-                [[-1., 0., 1.],
-                 [-2., 0., 2.],
-                 [-1., 0., 1.]]
-            ).view(1, 1, 3, 3)
-            sobel_kernel_y = torch.tensor(
-                [[-1., -2., -1.],
-                 [0., 0., 0.],
-                 [1., 2., 1.]]
-            ).view(1, 1, 3, 3)
-
-            # 注册为 buffer，推理期不参与梯度
-            self.register_buffer("sobel_kernel_x", sobel_kernel_x, persistent=False)
-            self.register_buffer("sobel_kernel_y", sobel_kernel_y, persistent=False)
-
-            # 将全局 edge 统计映射到每个通道的调制系数
-            # 输入: (B,2) -> 输出: (B,2*hidden_dim) 再拆成 edge_mod_h, edge_mod_w
-            self.edge_mlp = nn.Sequential(
-                nn.Linear(2, hidden_dim, bias=True),
-                nn.GELU(),
-                nn.Linear(hidden_dim, 2 * hidden_dim, bias=True),
-                nn.Tanh(),  # 输出范围约在 [-1,1]，后面再乘以小系数
-            )
-            # 控制调制强度的可学习缩放因子（初始化很小）
-            self.edge_alpha = nn.Parameter(torch.tensor(0.1, dtype=torch.float32))
-        else:
-            # 关闭 Sobel 调制时，避免属性不存在
-            self.register_buffer("sobel_kernel_x", None, persistent=False)
-            self.register_buffer("sobel_kernel_y", None, persistent=False)
-            self.edge_mlp = None
-            self.edge_alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32), requires_grad=False)
-
     @staticmethod
     def _cos_map(N, device, dtype):
         # 正交化 DCT-II 基: (n, x)
@@ -365,9 +465,6 @@ class Heat3D(nn.Module):
         B, C_in, S, H, W = x.shape
         device, dtype = x.device, x.dtype
         C = self.hidden_dim
-
-        # 保存一份原始输入用于 Sobel 边缘估计
-        x_in = x  # (B, C_in, S, H, W)
 
         # 1) local conv -> (B, C, S, H, W)
         x = self.local3d(x)  # (B, hidden_dim, S, H, W)
@@ -458,67 +555,10 @@ class Heat3D(nn.Module):
                 ky = ky.reshape(-1)
                 ks = ks.reshape(-1)
 
-            # ------------------ Sobel Edge 调制 kx, ky（温和版，可关闭） ------------------
-            if self.use_sobel_mod and (self.edge_mlp is not None):
-                # 只在训练/非推理模式下启用调制；也可以根据需要总是开启
-                with torch.no_grad():
-                    # 使用输入 x_in 估计空间边缘强度
-                    # 先把 S 维合并到 batch，转为 4D: (B*S, C_in, H, W)
-                    x_edge = x_in.permute(0, 2, 1, 3, 4).contiguous()  # (B,S,C_in,H,W)
-                    x_edge = x_edge.view(B * S, C_in, H, W)
-
-                    # 对每个通道复用同一组 Sobel 核：用分组卷积实现
-                    kx_sobel = self.sobel_kernel_x.to(device=device, dtype=dtype).expand(C_in, 1, 3, 3)
-                    ky_sobel = self.sobel_kernel_y.to(device=device, dtype=dtype).expand(C_in, 1, 3, 3)
-
-                    grad_x = F.conv2d(x_edge, kx_sobel, padding=1, groups=C_in)  # (B*S, C_in, H, W)
-                    grad_y = F.conv2d(x_edge, ky_sobel, padding=1, groups=C_in)  # (B*S, C_in, H, W)
-
-                    # 梯度幅值
-                    grad_mag = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-6)  # (B*S, C_in, H, W)
-
-                    # 在 H/W 上做平均，再在 C_in 上平均，得到每个样本每个谱片的整体边缘强度
-                    grad_mean_spatial = grad_mag.mean(dim=(2, 3))  # (B*S, C_in)
-                    grad_mean = grad_mean_spatial.mean(dim=1)  # (B*S,)
-
-                    # 再对 S 聚合得到每个 batch 样本一个标量
-                    grad_mean = grad_mean.view(B, S).mean(dim=1)  # (B,)
-
-                    # 同理也可以对 grad_x, grad_y 分别做 global mean，得到方向性信息
-                    gx_mean = grad_x.mean(dim=(2, 3))  # (B*S, C_in)
-                    gy_mean = grad_y.mean(dim=(2, 3))  # (B*S, C_in)
-                    gx_mean = gx_mean.mean(dim=1).view(B, S).mean(dim=1)  # (B,)
-                    gy_mean = gy_mean.mean(dim=1).view(B, S).mean(dim=1)  # (B,)
-
-                    # 组合两个标量特征
-                    edge_feat_1 = grad_mean
-                    edge_feat_2 = (gx_mean.abs() - gy_mean.abs())
-                    edge_global = torch.stack([edge_feat_1, edge_feat_2], dim=-1)  # (B,2)
-
-                # 通过一个小 MLP 将全局 edge 描述映射到每个通道的调制系数
-                edge_mod = self.edge_mlp(edge_global)  # (B, 2*C)
-                edge_mod = edge_mod.mean(dim=0)  # (2*C,)
-                edge_mod_h, edge_mod_w = torch.chunk(edge_mod, 2, dim=0)  # 各是 (C,)
-
-                # 使用 tanh + 小的 edge_alpha 做温和调制
-                kx_eff = kx * (1.0 + self.edge_alpha * edge_mod_h)
-                ky_eff = ky * (1.0 + self.edge_alpha * edge_mod_w)
-                ks_eff = ks  # 先不对谱向做调制
-
-                # 防止出现极端或负值，再次裁剪
-                kx_eff = torch.clamp(kx_eff, 0.0, 10.0)
-                ky_eff = torch.clamp(ky_eff, 0.0, 10.0)
-                ks_eff = torch.clamp(ks_eff, 0.0, 10.0)
-            else:
-                # 完全关闭 Sobel 调制：直接使用原始 kx, ky, ks
-                kx_eff = torch.clamp(kx, 0.0, 10.0)
-                ky_eff = torch.clamp(ky, 0.0, 10.0)
-                ks_eff = torch.clamp(ks, 0.0, 10.0)
-
-            # ------------------ 使用 kx_eff, ky_eff, ks_eff 构造衰减因子 ------------------
-            kx_v = kx_eff.view(1, C, 1, 1, 1)
-            ky_v = ky_eff.view(1, C, 1, 1, 1)
-            ks_v = ks_eff.view(1, C, 1, 1, 1)
+        # ------------------ 使用 kx_eff, ky_eff, ks_eff 构造衰减因子 ------------------
+        kx_v = kx.view(1, C, 1, 1, 1)
+        ky_v = ky.view(1, C, 1, 1, 1)
+        ks_v = ks.view(1, C, 1, 1, 1)
 
         alpha_h = self._alpha_h.to(device=device, dtype=dtype).view(1, 1, 1, H, 1)
         alpha_w = self._alpha_w.to(device=device, dtype=dtype).view(1, 1, 1, 1, W)
@@ -1014,7 +1054,8 @@ class Heat3D_Pipeline(nn.Module):
                  pca_P: Optional[torch.Tensor] = None,
                  use_checkpoint: bool = False,
                  freq_pool: str = "avgmax",
-                 use_post_norm: bool = True):
+                 use_post_norm: bool = True,
+                 ):
         super().__init__()
         self.band = band
         self.num_classes = num_classes
@@ -1023,7 +1064,6 @@ class Heat3D_Pipeline(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.freq_pool = freq_pool
         self.use_post_norm = use_post_norm
-
         # 1) 光谱降维器：其实现期望 (B, H, W, S)
         if reducer_type == "learnable":
             self.reducer = LearnableSpectralReducer(in_bands=band, out_bands=reduced_bands)
@@ -1044,28 +1084,14 @@ class Heat3D_Pipeline(nn.Module):
         modules = []
         for i in range(n_heat_layers):
             in_dim = 1 if i == 0 else heat_hidden_dim
-            if i == 0:
-                # 第一层：保持原始 local3d
-                modules.append(
-                    Heat3D(
-                        dim=in_dim,
-                        hidden_dim=heat_hidden_dim,
-                        use_local3d=True,
-                        light_in_proj=False,
-                        use_sobel_mod=False,  # 默认关闭
-                    )
+            modules.append(
+                Heat3D(
+                    dim=in_dim,
+                    hidden_dim=heat_hidden_dim,
+                    use_local3d=True,
+                    light_in_proj=False,
                 )
-            else:
-                # 第二层及之后：关闭 3x3x3，改用 1x1x1 轻量卷积
-                modules.append(
-                    Heat3D(
-                        dim=in_dim,
-                        hidden_dim=heat_hidden_dim,
-                        use_local3d=True,
-                        light_in_proj=False,
-                        use_sobel_mod=False,  # 默认关闭
-                    )
-                )
+            )
         self.heat_modules = nn.ModuleList(modules)
 
         # post_norm 改为可选

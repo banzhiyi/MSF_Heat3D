@@ -147,13 +147,33 @@ def create_universal_dataloaders(x_train_band, x_test_band, x_true_band, y_train
 
     return label_train_loader, label_test_loader, label_true_loader
 
+def augment_hsi_patch(sample_tensor):
+    """
+    最保守的数据增强：随机水平/垂直翻转 + 随机 0/90/180/270 旋转
+    输入: sample_tensor 形状为 [C, H, W]
+    仅在训练集上使用
+    """
+    # 随机水平翻转
+    if np.random.rand() < 0.5:
+        sample_tensor = torch.flip(sample_tensor, dims=[2])  # 宽度维度翻转 (W)
+
+    # 随机垂直翻转
+    if np.random.rand() < 0.5:
+        sample_tensor = torch.flip(sample_tensor, dims=[1])  # 高度维度翻转 (H)
+
+    # 随机 0/90/180/270 旋转
+    k = np.random.randint(0, 4)
+    if k > 0:
+        sample_tensor = torch.rot90(sample_tensor, k=k, dims=[1, 2])
+
+    return sample_tensor
 
 # 🚀 新增：统一的数据集类
 class UniversalDataset(Data.Dataset):
     """统一的数据集类，自动处理数组和文件路径"""
 
     def __init__(self, data_source, labels, identifier):
-        self.identifier = identifier
+        self.identifier = identifier# 标识 train/test/true
         self.labels = torch.from_numpy(labels).long()
 
         # 自动检测数据类型
@@ -185,6 +205,9 @@ class UniversalDataset(Data.Dataset):
         # 转换维度: (H, W, C) -> (C, H, W)
         sample_tensor = torch.from_numpy(sample.transpose(2, 0, 1)).float()
         label = self.labels[idx]
+        # ★ 仅对训练集做数据增强：identifier 里约定包含 "train"
+        if 'train' in self.identifier.lower():
+            sample_tensor = augment_hsi_patch(sample_tensor)
 
         return sample_tensor, label
 
