@@ -1098,7 +1098,7 @@ class Heat3D_Pipeline(nn.Module):
                  num_classes: int,
                  patches: int,
                  reduced_bands: int = 24,
-                 heat_hidden_dim: int = 64,
+                 heat_hidden_dim: int = 48,
                  n_heat_layers: int = 2,
                  head_channels: int = 128,
                  reducer_type: str = "learnable",
@@ -1138,7 +1138,7 @@ class Heat3D_Pipeline(nn.Module):
             in_dim = 1 if i == 0 else heat_hidden_dim
 
             # 只在第一层打开多尺度，后面保持单尺度
-            enable_ms = use_multiscale and (i < 1)
+            enable_ms = use_multiscale
 
             modules.append(
                 Heat3D(
