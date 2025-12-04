@@ -337,45 +337,73 @@ class Heat3D(nn.Module):
 
     def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96,
                  k_learnable=True, use_local3d: bool = True,
-                 light_in_proj: bool = False,
+                 light_in_proj: bool = False,use_multiscale: bool = False,
                  **kwargs):
         super().__init__()
         self.res = res
         self.hidden_dim = hidden_dim
         self.input_dim = dim  # 新增：保存输入维度
         self.infer_mode = infer_mode
-        # 3D 局部前处理
-        #self.local3d = nn.Conv3d(dim, hidden_dim, kernel_size=3, padding=1, bias=True)
-        # 3D 局部前处理 / 轻量前处理
-        if use_local3d:
-            # 原始 3x3x3 local3d
-            self.local3d = nn.Conv3d(
-                dim,
-                hidden_dim,
-                kernel_size=3,
+        self.use_multiscale = use_multiscale
+
+        # ----- 单尺度 / 多尺度 3D 局部前处理 -----
+        if self.use_multiscale:
+            # 多尺度 3 分支
+            self.local_spec = nn.Conv3d(
+                dim, hidden_dim,
+                kernel_size=(1, 1, 3),
+                stride=1,
+                padding=(0, 0, 1),
+                bias=True,
+            )
+            self.local_spat = nn.Conv3d(
+                dim, hidden_dim,
+                kernel_size=(3, 3, 1),
+                stride=1,
+                padding=(1, 1, 0),
+                bias=True,
+            )
+            self.local_both = nn.Conv3d(
+                dim, hidden_dim,
+                kernel_size=(3, 3, 3),
                 stride=1,
                 padding=1,
                 bias=True,
             )
+            # 尺度权重门控：w = softmax(MLP(global_pool(x)))
+            self.scale_mlp = nn.Sequential(
+                nn.Linear(dim, dim, bias=True),
+                nn.GELU(),
+            )
+            self.scale_proj = nn.Linear(dim, 3, bias=True)
         else:
-            if light_in_proj:
-                # 轻量 1x1x1 卷积，仅做通道映射，不引入局部空间卷积
+            # 兼容旧逻辑：单一 local3d / 轻量 in_proj / Identity
+            if use_local3d:
                 self.local3d = nn.Conv3d(
                     dim,
                     hidden_dim,
-                    kernel_size=1,
+                    kernel_size=3,
                     stride=1,
-                    padding=0,
+                    padding=1,
                     bias=True,
                 )
             else:
-                # 退化为恒等映射（要求 dim == hidden_dim）
-                if dim != hidden_dim:
-                    raise ValueError(
-                        f"Heat3D: use_local3d=False 且 light_in_proj=False 时, "
-                        f"要求 dim == hidden_dim, 得到 dim={dim}, hidden_dim={hidden_dim}"
+                if light_in_proj:
+                    self.local3d = nn.Conv3d(
+                        dim,
+                        hidden_dim,
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                        bias=True,
                     )
-                self.local3d = nn.Identity()
+                else:
+                    if dim != hidden_dim:
+                        raise ValueError(
+                            f"Heat3D: use_local3d=False 且 light_in_proj=False 时, "
+                            f"要求 dim == hidden_dim, 得到 dim={dim}, hidden_dim={hidden_dim}"
+                        )
+                    self.local3d = nn.Identity()
 
         # 产生两路：HCO 主分支 + 门控分支
         self.linear = nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
@@ -466,8 +494,31 @@ class Heat3D(nn.Module):
         device, dtype = x.device, x.dtype
         C = self.hidden_dim
 
-        # 1) local conv -> (B, C, S, H, W)
-        x = self.local3d(x)  # (B, hidden_dim, S, H, W)
+        # 1) local conv / multi-scale local conv -> (B, C, S, H, W)
+        if self.use_multiscale:
+            # 三个尺度分支
+            out1 = self.local_spec(x)  # (B, hidden_dim, S, H, W)
+            out2 = self.local_spat(x)  # (B, hidden_dim, S, H, W)
+            out3 = self.local_both(x)  # (B, hidden_dim, S, H, W)
+
+            # 全局池化：在 (S,H,W) 上做 mean，得到 (B, dim)
+            # 输入 x 仍是原始输入通道数 dim
+            B, C_in, S, H, W = x.shape
+            gp = x.mean(dim=(2, 3, 4))  # (B, C_in)
+
+            # MLP -> 3 标量权重 (每个样本一组三尺度权重)
+            scale_feat = self.scale_mlp(gp)  # (B, C_in)
+            logits = self.scale_proj(scale_feat)  # (B, 3)
+            weights = torch.softmax(logits, dim=-1)  # (B, 3)
+
+            # reshape 权重以便广播到 5D 特征上
+            w1 = weights[:, 0].view(B, 1, 1, 1, 1)
+            w2 = weights[:, 1].view(B, 1, 1, 1, 1)
+            w3 = weights[:, 2].view(B, 1, 1, 1, 1)
+
+            x = w1 * out1 + w2 * out2 + w3 * out3  # (B, hidden_dim, S, H, W)
+        else:
+            x = self.local3d(x)  # (B, hidden_dim, S, H, W)
 
         # 2) Linear -> split into main & gate branches.
         # self.linear expects last-dim features -> temporarily move channels to last
@@ -1055,6 +1106,7 @@ class Heat3D_Pipeline(nn.Module):
                  use_checkpoint: bool = False,
                  freq_pool: str = "avgmax",
                  use_post_norm: bool = True,
+                 use_multiscale: bool = True,
                  ):
         super().__init__()
         self.band = band
@@ -1084,14 +1136,20 @@ class Heat3D_Pipeline(nn.Module):
         modules = []
         for i in range(n_heat_layers):
             in_dim = 1 if i == 0 else heat_hidden_dim
+
+            # 只在第一层打开多尺度，后面保持单尺度
+            enable_ms = use_multiscale and (i < 1)
+
             modules.append(
                 Heat3D(
                     dim=in_dim,
                     hidden_dim=heat_hidden_dim,
-                    use_local3d=True,
+                    use_local3d=True,  # 仍然使用 3x3x3 作为其中一支 (local_both)
                     light_in_proj=False,
+                    use_multiscale=enable_ms,
                 )
             )
+
         self.heat_modules = nn.ModuleList(modules)
 
         # post_norm 改为可选
