@@ -6,7 +6,7 @@ import torch.backends.cudnn as cudnn
 from scipy.io import savemat
 from torch import optim
 from s2vnet_model import S2VNet
-from vheat3d_model import S2VHeat3D, Heat3D_Pipeline
+from vheat3d_model import Heat3D_Pipeline
 from utils import AvgrageMeter, accuracy, output_metric, NonZeroClipper, print_args
 from dataset import prepare_dataset
 import numpy as np
@@ -311,8 +311,6 @@ def main():
     # create model
     if args.model_name == 's2vnet':
         model = S2VNet(band, num_classes, args.patches)
-    elif args.model_name == 'vheat3d':
-        model = S2VHeat3D(band, num_classes, args.patches)
     elif args.model_name == 'Heat3D_Pipeline':
         model = Heat3D_Pipeline(band, num_classes, args.patches,)
     else:
