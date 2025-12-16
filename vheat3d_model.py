@@ -326,7 +326,60 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+class FreqBranchAttention(nn.Module):
+    """
+    对多路 Heat3D 分支做频率自适应融合:
+    输入: list of Tensors, 每个形状 [B, C, S, H, W]
+    输出: 融合后的 [B, C, S, H, W]
+    """
+    def __init__(self, channels: int, num_branches: int = 3, alpha: float = 0.5,
+                 hidden: int = None):
+        super().__init__()
+        self.channels = channels
+        self.num_branches = num_branches
+        hidden = hidden or channels
+        self.alpha = alpha  # \* 新增: 学习注意力和均匀权重的插值系数
+        # 输入为 [B, num_branches * C] 的全局频谱池化向量
+        self.mlp = nn.Sequential(
+            nn.Linear(num_branches * channels, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_branches)
+        )
 
+    def forward(self, feats):
+        """
+        feats: list of length num_branches, 每个 [B, C, S, H, W]
+        """
+        assert len(feats) == self.num_branches
+        B, C, S, H, W = feats[0].shape
+
+        # 1) 对每个分支做频谱+空间池化 -> [B, C]
+        pooled_list = []
+        for x in feats:
+            # 先在 (S,H,W) 上做全局平均 -> [B, C]
+            pooled = x.mean(dim=(2, 3, 4))
+            pooled_list.append(pooled)
+        # [B, num_branches*C]
+        pooled_cat = torch.cat(pooled_list, dim=1)
+
+        # 2) 通过 MLP 产生每个样本的 branch 权重 -> [B, num_branches]
+        logits = self.mlp(pooled_cat)
+        weights = F.softmax(logits, dim=-1)  # [B, num_branches]
+
+        # \* 新增: 与均匀权重做温和插值，避免一开始注意力过于极端
+        if self.alpha < 1.0:
+            # 均匀权重 [1/num_branches, ..., 1/num_branches]
+            uniform = torch.full_like(weights, 1.0 / self.num_branches)
+            weights = self.alpha * weights + (1.0 - self.alpha) * uniform
+            # 再归一化一次，确保行和为 1
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        # 3) 融合各分支
+        out = 0.0
+        for i, x in enumerate(feats):
+            w = weights[:, i].view(B, 1, 1, 1, 1)
+            out = out + w * x
+        return out
 
 class Heat3D(nn.Module):
     """
@@ -338,6 +391,7 @@ class Heat3D(nn.Module):
     def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96,
                  k_learnable=True, use_local3d: bool = True,
                  light_in_proj: bool = False,use_multiscale: bool = False,
+                 freq_mode: str = "mid",
                  **kwargs):
         super().__init__()
         self.res = res
@@ -345,7 +399,7 @@ class Heat3D(nn.Module):
         self.input_dim = dim  # 新增：保存输入维度
         self.infer_mode = infer_mode
         self.use_multiscale = use_multiscale
-
+        self.freq_mode = freq_mode  # \* 保存频率模式: "low" / "mid" / "high"
         # ----- 单尺度 / 多尺度 3D 局部前处理 -----
         if self.use_multiscale:
             # 多尺度 3 分支
@@ -605,6 +659,26 @@ class Heat3D(nn.Module):
                 kx = kx.reshape(-1)
                 ky = ky.reshape(-1)
                 ks = ks.reshape(-1)
+                # \* 根据 freq_mode 对 k 进行简单的频率偏置
+                if self.freq_mode == "low":
+                    scale = 1.2
+                    kx = kx * scale
+                    ky = ky * scale
+                    ks = ks * scale
+
+                elif self.freq_mode == "high":
+
+                    # 减弱衰减：整体缩小 k，同时给一点偏置，避免全 0
+
+                    scale = 0.9
+                    bias = 0.05
+                    kx = kx * scale + bias
+                    ky = ky * scale + bias
+                    ks = ks * scale + bias
+
+                else:
+                    # "mid" 或其他: 保持默认
+                    pass
 
         # ------------------ 使用 kx_eff, ky_eff, ks_eff 构造衰减因子 ------------------
         kx_v = kx.view(1, C, 1, 1, 1)
@@ -649,7 +723,60 @@ class Heat3D(nn.Module):
 
         return x.contiguous()
 
+class ParallelHeat3DLayer(nn.Module):
+    """
+    第二层: 多个 Heat3D 分支并行 \+ 自适应频率融合
+    假设所有分支输入输出通道相同: \[B, C, S, H, W]
+    """
+    def __init__(self, heat_block_cls, channels: int, inner_dim: int = None,
+                 num_branches: int = 3,
+                 freq_config: str = "all_mid"):
+        """
+        freq_config:
+          - "all_mid": \["mid", "mid", ...]
+          - "mid_high": 例如 2 分支时 \["mid","high"]
+          - "low_mid_high": 3 分支时 \["low","mid","high"]
+        """
+        super().__init__()
+        self.num_branches = num_branches
+        inner_dim = inner_dim or channels // 2
 
+        # 根据策略生成 freq_modes
+        if freq_config == "all_mid":
+            base_freq_modes = ["mid"] * num_branches
+        elif freq_config == "mid_high":
+            # 逐步打开: 先只有 mid \+ high
+            base_freq_modes = ["mid", "high", "high"]
+        elif freq_config == "low_mid_high":
+            base_freq_modes = ["low", "mid", "high"]
+        else:
+            raise ValueError(f"未知 freq_config: {freq_config}")
+
+        freq_modes = base_freq_modes[:num_branches]
+
+        self.branches = nn.ModuleList()
+        for m in freq_modes:
+            self.branches.append(
+                heat_block_cls(
+                    dim=channels,
+                    hidden_dim=inner_dim,
+                    use_local3d=True,
+                    light_in_proj=False,
+                    use_multiscale=True,
+                    freq_mode=m
+                )
+            )
+
+        # 把 inner_dim 投回 channels
+        self.proj = nn.Conv3d(inner_dim, channels, kernel_size=1, bias=True)
+        self.fuse = FreqBranchAttention(channels=inner_dim, num_branches=num_branches)
+
+    def forward(self, x):
+        # x: \[B, C, S, H, W]
+        feats = [branch(x, None) for branch in self.branches]
+        fused = self.fuse(feats)
+        out = self.proj(fused)  # \[B,channels,S,H,W]
+        return out
 
 
 
@@ -681,7 +808,6 @@ class Heat3D_Pipeline(nn.Module):
                  patches: int,
                  reduced_bands: int = 24,
                  heat_hidden_dim: int = 48,
-                 n_heat_layers: int = 2,
                  head_channels: int = 128,
                  reducer_type: str = "learnable",
                  pca_P: Optional[torch.Tensor] = None,
@@ -714,31 +840,28 @@ class Heat3D_Pipeline(nn.Module):
         else:
             raise ValueError(f"未知 reducer_type: {reducer_type}")
 
-        # 2) Heat3D 堆叠：首层保留 3x3x3 local3d，后续层可改为轻量 1x1x1 卷积
-        modules = []
-        for i in range(n_heat_layers):
-            in_dim = 1 if i == 0 else heat_hidden_dim
+        # ---- 2) Heat3D 主干：第一层串行 + 第二层并行 ----
+        # 第一层: 单个 Heat3D, 输入通道=1, 输出=heat_hidden_dim
+        self.heat_first = Heat3D(
+            dim=1,
+            hidden_dim=heat_hidden_dim,
+            use_local3d=True,
+            light_in_proj=False,
+            use_multiscale=use_multiscale,
+            freq_mode="mid"  # 第一层用中频/常规模式即可
+        )
+        self.first_norm = LayerNorm3d(heat_hidden_dim) if use_post_norm else nn.Identity()
 
-            # 只在第一层打开多尺度，后面保持单尺度
-            enable_ms = use_multiscale
+        # 第二层: 并行 Heat3D 分支
+        self.heat_parallel = ParallelHeat3DLayer(
+            heat_block_cls=Heat3D,
+            channels=heat_hidden_dim,
+            num_branches=3,
+            freq_config="low_mid_high" # 基线: 所有分支 freq_mode="mid"
+        )
+        self.second_norm = LayerNorm3d(heat_hidden_dim) if use_post_norm else nn.Identity()
 
-            modules.append(
-                Heat3D(
-                    dim=in_dim,
-                    hidden_dim=heat_hidden_dim,
-                    use_local3d=True,  # 仍然使用 3x3x3 作为其中一支 (local_both)
-                    light_in_proj=False,
-                    use_multiscale=enable_ms,
-                )
-            )
 
-        self.heat_modules = nn.ModuleList(modules)
-
-        # post_norm 改为可选
-        if self.use_post_norm:
-            self.post_norms = nn.ModuleList([LayerNorm3d(heat_hidden_dim) for _ in range(n_heat_layers)])
-        else:
-            self.post_norms = nn.ModuleList([nn.Identity() for _ in range(n_heat_layers)])
 
         # 3) 频率融合与分类头
         self.spectral_fusion = nn.Conv3d(
@@ -844,14 +967,23 @@ class Heat3D_Pipeline(nn.Module):
         else:                           # (B, H, W, S')
             x3d = x_red.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
 
-        # Heat3D 堆叠：首层 1->hidden_dim，其后 hidden_dim->hidden_dim
-        for module, norm in zip(self.heat_modules, self.post_norms):
-            if self.use_checkpoint:
-                x3d = checkpoint.checkpoint(module, x3d, None)
-            else:
-                x3d = module(x3d, None)
-            # post_norm 可选
-            x3d = norm(x3d)  # (B, hidden_dim, S, H, W)
+        # 2) 第一层 Heat3D
+        if self.use_checkpoint:
+            x3d = torch.utils.checkpoint.checkpoint(self.heat_first, x3d, None)
+        else:
+            x3d = self.heat_first(x3d, None)
+        x3d = self.first_norm(x3d)
+
+        # 3) 第二层并行 Heat3D + 频率自适应融合
+        residual = x3d
+        if self.use_checkpoint:
+            x3d = torch.utils.checkpoint.checkpoint(self.heat_parallel, x3d)
+        else:
+            x3d = self.heat_parallel(x3d)
+        x3d = self.second_norm(x3d)  # [B, C, S, H, W]
+
+        lambda_scale = 0.3  # 可以先写死一个小系数
+        x3d = residual + lambda_scale * x3d
 
         # 频率融合 -> 2D Head
         x3d = self.spectral_fusion(x3d)  # (B, head_channels, S, H, W)
