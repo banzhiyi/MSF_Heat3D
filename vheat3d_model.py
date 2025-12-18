@@ -332,7 +332,7 @@ class FreqBranchAttention(nn.Module):
     输入: list of Tensors, 每个形状 [B, C, S, H, W]
     输出: 融合后的 [B, C, S, H, W]
     """
-    def __init__(self, channels: int, num_branches: int = 3, alpha: float = 0.5,
+    def __init__(self, channels: int, num_branches: int = 3, alpha: float = 0.4,
                  hidden: int = None):
         super().__init__()
         self.channels = channels
@@ -538,7 +538,7 @@ class Heat3D(nn.Module):
         self.ky_exp = (self._alpha_w.view(1, W, 1, 1) ** ky).to(device=device, dtype=dtype)
         self.ks_exp = (self._alpha_s.view(1, 1, S, 1) ** ks).to(device=device, dtype=dtype)
 
-    def forward(self, x: torch.Tensor, freq_embed=None):
+    def forward(self, x: torch.Tensor, freq_embed=None, freq_mask: torch.Tensor = None):
         """
         Stable channels-first implementation.
         x: (B, C_in, S, H, W)
@@ -608,6 +608,18 @@ class Heat3D(nn.Module):
         x_2d = x.view(-1, W)  # (B*C*S*H, W) since W is last already
         x_2d = x_2d @ W_w.t()  # (B*C*S*H, W)
         x = x_2d.view(B, C, S, H, W)  # (B,C,S,H,W)
+
+        # ====== 频带掩码：让不同 Heat3D 分支专责不同频段 ======
+        # freq_mask 预期形状: (1,1,S,H,W) 或 (B,1,S,H,W)
+        if freq_mask is not None:
+            # 若只给了 (1,1,S,H,W)，这里 broadcast 到 (B,1,S,H,W)
+            if freq_mask.shape[0] == 1 and B > 1:
+                freq_mask = freq_mask.expand(B, -1, -1, -1, -1)
+            # 若通道维为 1，这里再 broadcast 到 C 通道
+            if freq_mask.shape[1] == 1 and C > 1:
+                freq_mask = freq_mask.expand(-1, C, -1, -1, -1)
+            # 最终与 x 同形状 \[B,C,S,H,W] 做逐元素乘法
+            x = x * freq_mask
 
         # ---------- Frequency-domain damping (make shapes broadcastable) ----------
         # Build per-channel k vectors
@@ -730,7 +742,9 @@ class ParallelHeat3DLayer(nn.Module):
     """
     def __init__(self, heat_block_cls, channels: int, inner_dim: int = None,
                  num_branches: int = 3,
-                 freq_config: str = "all_mid"):
+                 freq_config: str = "low_mid_high",
+                 parallel_cfg: Optional[dict] = None,
+                 ):
         """
         freq_config:
           - "all_mid": \["mid", "mid", ...]
@@ -740,7 +754,17 @@ class ParallelHeat3DLayer(nn.Module):
         super().__init__()
         self.num_branches = num_branches
         inner_dim = inner_dim or channels // 2
-
+        # 保存配置（带默认值）
+        cfg = parallel_cfg or {}
+        self.low_thresh = cfg.get("low_thresh", 0.33)
+        self.high_thresh = cfg.get("high_thresh", 0.66)
+        # 🆕 中频阈值
+        self.mid_low = cfg.get("mid_low", 0.2)
+        self.mid_high = cfg.get("mid_high", 0.8)
+        self.eps_low = cfg.get("eps_low", 0.4)
+        self.eps_mid = cfg.get("eps_mid", 0.3)
+        self.eps_high = cfg.get("eps_high", 0.4)
+        alpha = cfg.get("alpha", 0.5)
         # 根据策略生成 freq_modes
         if freq_config == "all_mid":
             base_freq_modes = ["mid"] * num_branches
@@ -769,13 +793,67 @@ class ParallelHeat3DLayer(nn.Module):
 
         # 把 inner_dim 投回 channels
         self.proj = nn.Conv3d(inner_dim, channels, kernel_size=1, bias=True)
-        self.fuse = FreqBranchAttention(channels=inner_dim, num_branches=num_branches)
+        self.fuse = FreqBranchAttention(channels=inner_dim, num_branches=num_branches, alpha=alpha,)
 
-    def forward(self, x):
-        # x: \[B, C, S, H, W]
-        feats = [branch(x, None) for branch in self.branches]
-        fused = self.fuse(feats)
-        out = self.proj(fused)  # \[B,channels,S,H,W]
+    def forward(self, x, freq_embed_parallel=None):
+        # x: (B, C, S, H, W)
+        B, C, S, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # ----- 构造 1D 归一化频率索引 [0,1] -----
+        idx_s = torch.linspace(0.0, 1.0, steps=S, device=device, dtype=dtype)  # (S,)
+        idx_h = torch.linspace(0.0, 1.0, steps=H, device=device, dtype=dtype)  # (H,)
+        idx_w = torch.linspace(0.0, 1.0, steps=W, device=device, dtype=dtype)  # (W,)
+
+        # 这里给一个简单的「半径型」频率定义：距离 0 位置的归一化距离越大，认为频率越高
+        # freq_radius \[S,H,W] in [0,1]
+        grid_s = idx_s.view(S, 1, 1)     # (S,1,1)
+        grid_h = idx_h.view(1, H, 1)     # (1,H,1)
+        grid_w = idx_w.view(1, 1, W)     # (1,1,W)
+        # 一个简单合成：取三者的均值当作总频率
+        freq_radius = (grid_s + grid_h + grid_w) / 3.0  # (S,H,W)
+
+        # ----- 设计三个频带掩码: 低 / 中 / 高 -----
+        # 阈值可以以后再调，这里先给一个直观划分:
+        #   低频:   r in [0.0, 0.33]
+        #   中频:   r in (0.2, 0.8)
+        #   高频:   r in [0.66, 1.0]
+        low_thresh = self.low_thresh
+        high_thresh = self.high_thresh
+        mid_low = self.mid_low
+        mid_high = self.mid_high
+
+        # 基础掩码
+        mask_low = (freq_radius <= low_thresh).float()            # 低频为 1，其余为 0
+        mask_high = (freq_radius >= high_thresh).float()          # 高频为 1，其余为 0
+        # 中频：抑制最中心低频和最尖锐高频，仅保留中段
+        mask_mid = ((freq_radius > mid_low) & (freq_radius < mid_high)).float()
+
+        # 为了避免过于生硬，可以给被抑制部分一个小系数（而不是严格 0）
+        eps_low = self.eps_low
+        eps_mid = self.eps_mid
+        eps_high = self.eps_high
+        mask_low = eps_low + (1.0 - eps_low) * mask_low     # 低频区域 ~1，其余 ~eps_low
+        mask_mid = eps_mid + (1.0 - eps_mid) * mask_mid     # 中频区域 ~1，其余 ~eps_mid
+        mask_high = eps_high + (1.0 - eps_high) * mask_high # 高频区域 ~1，其余 ~eps_high
+
+        # reshape 成 (1,1,S,H,W)，后面在 Heat3D 内 broadcast 到 (B,C,S,H,W)
+        mask_low = mask_low.view(1, 1, S, H, W)
+        mask_mid = mask_mid.view(1, 1, S, H, W)
+        mask_high = mask_high.view(1, 1, S, H, W)
+
+        # 假设 num_branches == 3 且 freq_config == "low_mid_high"
+        out_low = self.branches[0](x, freq_embed_parallel, freq_mask=mask_low)
+        out_mid = self.branches[1](x, freq_embed_parallel, freq_mask=mask_mid)
+        out_high = self.branches[2](x, freq_embed_parallel, freq_mask=mask_high)
+
+        # 频率自适应融合，仍然是 \[B, inner_dim, S, H, W]
+        out = self.fuse([out_low, out_mid, out_high])
+
+        # 使用 1x1x1 Conv3d 把 inner_dim 投回 channels，保持与输入一致
+        out = self.proj(out)  # 形状变为 \[B, channels, S, H, W]
+
         return out
 
 
@@ -815,6 +893,7 @@ class Heat3D_Pipeline(nn.Module):
                  freq_pool: str = "avgmax",
                  use_post_norm: bool = True,
                  use_multiscale: bool = True,
+                 dataset_name: str = "indian",
                  ):
         super().__init__()
         self.band = band
@@ -840,6 +919,46 @@ class Heat3D_Pipeline(nn.Module):
         else:
             raise ValueError(f"未知 reducer_type: {reducer_type}")
 
+        ds = dataset_name.lower()
+        if ds == "indian":
+            # Indian 专用 freq 掩码 & alpha 配置
+            self.parallel_cfg = {
+                "low_thresh": 0.33,
+                "high_thresh": 0.66,
+                "mid_low": 0.2,  # 中频下界
+                "mid_high": 0.8,  # 中频上界
+                "eps_low": 0.4,
+                "eps_mid": 0.3,
+                "eps_high": 0.4,
+                "alpha": 0.5,
+            }
+        elif ds in ["augsburg", "houston"]:
+            # Augsburg 专用 freq 掩码 & alpha 配置（示例）
+            self.parallel_cfg = {
+                "low_thresh": 0.25,
+                "high_thresh": 0.75,
+                "mid_low": 0.3,  # 中频下界
+                "mid_high": 0.7,  # 中频上界
+                "eps_low": 0.4,
+                "eps_mid": 0.3,
+                "eps_high": 0.4,
+                "alpha": 0.5,
+            }
+        elif dataset_name.lower() == "pavia":
+            # Augsburg 专用 freq 掩码 & alpha 配置（示例）
+            self.parallel_cfg = {
+                "low_thresh": 0.25,
+                "high_thresh": 0.75,
+                "mid_low": 0.3,
+                "mid_high": 0.7,
+                "eps_low": 0.4,
+                "eps_mid": 0.3,
+                "eps_high": 0.4,
+                "alpha": 0.3,
+            }
+        else:
+            raise ValueError(f"Unknown dataset_name: {dataset_name}")
+
         # ---- 2) Heat3D 主干：第一层串行 + 第二层并行 ----
         # 第一层: 单个 Heat3D, 输入通道=1, 输出=heat_hidden_dim
         self.heat_first = Heat3D(
@@ -857,7 +976,7 @@ class Heat3D_Pipeline(nn.Module):
             heat_block_cls=Heat3D,
             channels=heat_hidden_dim,
             num_branches=3,
-            freq_config="low_mid_high" # 基线: 所有分支 freq_mode="mid"
+            freq_config="low_mid_high" # “low" "mid" "high"
         )
         self.second_norm = LayerNorm3d(heat_hidden_dim) if use_post_norm else nn.Identity()
 
@@ -883,6 +1002,7 @@ class Heat3D_Pipeline(nn.Module):
             nn.Flatten(),
             nn.Linear(head_channels, num_classes)
         )
+
 
     @staticmethod
     def _to_channels_last_hw_s(x: torch.Tensor, band: int) -> torch.Tensor:
