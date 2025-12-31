@@ -4,7 +4,7 @@ from scipy.io import loadmat
 import numpy as np
 import os
 import h5py
-
+from sklearn.decomposition import PCA
 def prepare_dataset(args, samples_type='ratio'):
     # prepare data
     if args.dataset in ['Indian', 'Pavia', 'Houston']:
@@ -55,14 +55,38 @@ def prepare_dataset(args, samples_type='ratio'):
         input_min = np.min(input[:, :, i])
         input_normalize[:, :, i] = (input[:, :, i] - input_min) / (input_max - input_min)
 
-    # data size
-    height, width, band = input.shape
-    print("height={0},width={1},band={2}".format(height, width, band))
+    # === 这里开始：根据模型类型决定是否做 PCA ===
+    if getattr(args, "model_name", None) == 'HybridSN':
+        # 1) 在整幅图像上做 PCA（严格按原 HybridSN 流程）
+        H, W, C = input_normalize.shape
+        X = input_normalize.reshape(-1, C)
 
-    # obtain train and test data
-    total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(
-        TR, TE, label, num_classes)
-    mirror_image = mirror_hsi(height, width, band, input_normalize, patch=args.patches)
+        n_components = 15  # 可按论文或需求调整
+        print(f"HybridSN 模型启用 PCA 光谱降维，n_components = {n_components}")
+        pca = PCA(n_components=n_components, whiten=False)
+        X_pca = pca.fit_transform(X)
+        input_pca = X_pca.reshape(H, W, n_components)
+
+        # 2) 使用 PCA 后的数据作为后续 patch 提取的输入
+        height, width, band = input_pca.shape
+        print("PCA 后数据形状: height={0},width={1},band={2}".format(height, width, band))
+
+        # obtain train and test data
+        total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(
+            TR, TE, label, num_classes)
+
+        # 用 PCA 后的数据生成镜像图像
+        mirror_image = mirror_hsi(height, width, band, input_pca, patch=args.patches)
+    else:
+        # 其他模型保持原来的预处理，不做 PCA
+        height, width, band = input.shape
+        print("height={0},width={1},band={2}".format(height, width, band))
+
+        # obtain train and test data
+        total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(
+            TR, TE, label, num_classes)
+
+        mirror_image = mirror_hsi(height, width, band, input_normalize, patch=args.patches)
 
     # 智能选择数据加载策略
     x_train_band, x_test_band, x_true_band = train_and_test_data_optimized(

@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import torch.nn.functional as F
-from vheat3d_model import Heat3D_Pipeline
+from vheat3d_model import MSF_Heat3D
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -104,27 +104,28 @@ def select_class_colors(dataset_key: str):
     return INDIAN_PINES_COLORS
 
 def build_model(band: int, num_classes: int, patch_size: int, ckpt_path: str, *,
-                reduced_bands=24, heat_hidden_dim=64, n_heat_layers=2,
+                reduced_bands=24, heat_hidden_dim=64,
                 head_channels=128, reducer_type="learnable", pca_path: Optional[str] = None,
-                freq_pool="avgmax", use_post_norm=True):
+                freq_pool="avgmax", use_post_norm=True,dataset_name: str):
     pca_tensor = None
     if reducer_type == "pca":
         if not pca_path:
             raise ValueError("PCA 模式需要提供 --pca_path。")
         pca_tensor = torch.from_numpy(np.load(pca_path)).float()
-    model = Heat3D_Pipeline(
+    model = MSF_Heat3D(
         band=band,
         num_classes=num_classes,
         patches=patch_size,
-        reduced_bands=reduced_bands,
-        heat_hidden_dim=heat_hidden_dim,
-        n_heat_layers=n_heat_layers,
-        head_channels=head_channels,
-        reducer_type=reducer_type,
+        reduced_bands=24,
+        heat_hidden_dim=48,
+        head_channels=128,
+        reducer_type="learnable",
         pca_P=pca_tensor,
         use_checkpoint=False,
         freq_pool=freq_pool,
         use_post_norm=use_post_norm,
+        use_multiscale=True,  # \* 根据你当前 Heat3D_Pipeline 默认使用多尺度
+        dataset_name=dataset_name,
     )
     if os.path.isfile(ckpt_path):
         state = torch.load(ckpt_path, map_location="cpu")
@@ -186,7 +187,7 @@ def build_class_colormap(num_classes: int, background_color=(0, 0, 0), class_col
     return cmap, norm
 
 def plot_results(false_color: np.ndarray, gt: np.ndarray, pred: np.ndarray, dataset_name: str,
-                 save_dir: str, num_classes: int, class_colors):
+                 save_dir: str, num_classes: int, class_colors, ):
     os.makedirs(save_dir, exist_ok=True)
     safe_name = dataset_name.lower().replace(" ", "_")
     title_prefix = dataset_name.replace("_", " ")
@@ -245,7 +246,6 @@ def main():
     parser.add_argument("--false_color_bands", nargs=3, type=int, default=(30, 20, 10))
     parser.add_argument("--reduced_bands", type=int, default=24)
     parser.add_argument("--heat_hidden_dim", type=int, default=64)
-    parser.add_argument("--n_heat_layers", type=int, default=2)
     parser.add_argument("--head_channels", type=int, default=128)
     parser.add_argument("--reducer_type", choices=["learnable", "pca"], default="learnable")
     parser.add_argument("--pca_path", default=None)
@@ -266,12 +266,12 @@ def main():
         ckpt_path=args.ckpt_path,
         reduced_bands=args.reduced_bands,
         heat_hidden_dim=args.heat_hidden_dim,
-        n_heat_layers=args.n_heat_layers,
         head_channels=args.head_channels,
         reducer_type=args.reducer_type,
         pca_path=args.pca_path,
         freq_pool=args.freq_pool,
         use_post_norm=not args.disable_post_norm,
+        dataset_name=dataset_name,
     )
     pred_map = sliding_window_predict(
         hsi=hsi,
@@ -282,7 +282,8 @@ def main():
         batch_size=args.batch_size,
     )
     pred_vis = pred_map if zero_based_pred else pred_map + 1
-    plot_results(false_color, gt, pred_vis, dataset_name, args.output_dir, num_classes, class_colors)
+    plot_results(false_color, gt, pred_vis,  dataset_name,
+                 args.output_dir, num_classes, class_colors, )
 
 if __name__ == "__main__":
     main()

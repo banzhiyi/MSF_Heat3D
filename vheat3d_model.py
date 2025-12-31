@@ -1,151 +1,13 @@
-import time
 import math
-from functools import partial
 from typing import Optional, Callable
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from einops import rearrange, repeat
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
-def dct_1d(x, dim=-1):
-    """
-    对指定维度做 1D DCT-II，实数变换，线性、无参数。
-    x: 任意形状 Tensor
-    """
-    N = x.size(dim)
-    # 使用 FFT 的实数部分近似 DCT，保持线性
-    # 这里采用一种常用 trick: 在 2N 上做 FFT，再取实部
-    x = torch.cat([x, x.flip(dims=[dim])], dim=dim)  # 对称扩展
-    X = torch.fft.rfft(x, dim=dim)
-    # 只取前 N 个频率分量
-    slices = [slice(None)] * x.dim()
-    slices[dim] = slice(0, N)
-    X = X[tuple(slices)].real
-    return X
 
-
-def idct_1d(X, dim=-1):
-    """
-    对指定维度做 1D 逆 DCT（对应上面的 dct_1d），保持线性。
-    X: 任意形状 Tensor，最后一维为频率长度 N
-    """
-    N = X.size(dim)
-    # 反向构造长度为 2N 的对称谱，然后用 irfft
-    zeros_shape = list(X.shape)
-    zeros_shape[dim] = 1
-    zeros_pad = X.new_zeros(zeros_shape)
-
-    # 拼出长度为 N+1 的 rfft 频谱（实数信号 rfft 长度为 N+1）
-    # 这里用一个简化近似：补 0，然后 irfft，再截断
-    X_rfft = torch.cat([X, zeros_pad], dim=dim)  # [ ..., N+1 ]
-    x_rec = torch.fft.irfft(X_rfft, n=2 * N, dim=dim)
-
-    # 取前 N 个样本作为近似的 idct 结果
-    slices = [slice(None)] * x_rec.dim()
-    slices[dim] = slice(0, N)
-    x_rec = x_rec[tuple(slices)]
-    return x_rec
-
-class SpectralFrequencyGating(nn.Module):
-    """
-    仅在谱维做 1D 频域建模的轻量门控模块。
-
-    预期输入/输出形状:
-    - 输入:  x \[B, C, H, W, D\] 或 \[B, C, D, H, W\]，通过 `spec_dim` 控制谱维位置。
-    - 输出: 同形状，乘上 \[B, C, 1, 1, D\] broadcast 的 sigmoid 门控。
-
-    流程:
-    1) H,W 上全局平均池化 -> x_mean \[B, C, D\]
-    2) D 维上 DCT -> X_freq \[B, C, D\]
-    3) 频域上 depthwise Conv1d -> X_freq_mod
-    4) IDCT 回时域 -> gate_spec \[B, C, D\]
-    5) sigmoid + broadcast -> x * gate
-    """
-    def __init__(self, channels, spec_length, spec_dim=-1, kernel_size=3, use_pointwise=True):
-        super(SpectralFrequencyGating, self).__init__()
-        self.channels = channels
-        self.spec_length = spec_length
-        self.spec_dim = spec_dim  # x 中谱维所在的维度索引
-
-        padding = kernel_size // 2
-
-        # 频域上的 depthwise Conv1d：每个通道一组频率响应
-        self.dw_conv = nn.Conv1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            groups=channels,
-            bias=True
-        )
-
-        # 可选: 一个 pointwise Conv1d，在频率维上做轻量 mixing
-        if use_pointwise:
-            self.pw_conv = nn.Conv1d(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=1,
-                bias=True
-            )
-        else:
-            self.pw_conv = None
-
-    def forward(self, x):
-        """
-        x: 形状 \[B, C, ..., D, ...\]，其中谱维长度为 self.spec_length。
-        只对谱维做 gating，不改变 H,W 结构。
-        """
-        # 1) 把谱维交换到最后，方便 pooling 和 DCT
-        # 假设当前 spec_dim 位置是 self.spec_dim
-        if self.spec_dim != -1:
-            x = x.transpose(self.spec_dim, -1)  # 现在谱维在 -1
-
-        # 此时假设 x: [B, C, H, W, D] 或 [B, C, *, D]
-        B, C = x.shape[0], x.shape[1]
-        D = x.shape[-1]
-
-        # 2) 沿 H,W 做全局平均池化，只保留谱维 D
-        #    无论中间有几个空间维，统统平均掉，只保留 [B, C, D]
-        spatial_dims = list(range(2, x.dim() - 1))  # 排除 B,C,D 其余都视为空间维
-        if len(spatial_dims) > 0:
-            x_mean = x.mean(dim=spatial_dims, keepdim=False)  # [B, C, D]
-        else:
-            x_mean = x  # 已经没有空间维了
-
-        # 3) DCT: 频域变换（线性，无参数）
-        X_freq = dct_1d(x_mean, dim=-1)  # [B, C, D]
-
-        # 4) 在频域做 1D conv：先视 C 为通道，用 Conv1d 的 (N=C, L=D) 约定
-        #    Conv1d 期望输入 [B, C, L]，当前就是 [B, C, D]
-        X_mod = self.dw_conv(X_freq)  # [B, C, D]
-        if self.pw_conv is not None:
-            X_mod = self.pw_conv(X_mod)  # [B, C, D]
-
-        # 5) 逆 DCT 回谱域
-        gate_spec = idct_1d(X_mod, dim=-1)  # [B, C, D]
-
-        # 6) sigmoid 归一化，作为软门控
-        gate_spec = torch.sigmoid(gate_spec)  # [B, C, D]
-
-        # 7) 将 gate_spec broadcast 回原始 x 的形状
-        #    先恢复谱维为 -1，其它空间维通过 unsqueeze/broadcast
-        # 先扩展为 [B, C, 1, 1, D, ...] 与 x 匹配
-        # 构造一个形状列表 [B, C, 1, 1, ..., D]
-        while gate_spec.dim() < x.dim():
-            gate_spec = gate_spec.unsqueeze(-2)  # 在 D 前面不断插入 1 维度
-
-        # 现在 gate_spec 和 x 同维度数，最后一维都是 D，可以 broadcast
-        x = x * gate_spec
-
-        # 8) 如果一开始挪动过谱维位置，这里再挪回去
-        if self.spec_dim != -1:
-            x = x.transpose(self.spec_dim, -1)
-
-        return x
 # ---------- 谱降维模块 ----------
 class LearnableSpectralReducer(nn.Module):
     """
@@ -252,79 +114,6 @@ class LayerNorm3d(nn.Module):
             raise ValueError(f"LayerNorm3d cannot determine channel dimension. "
                              f"Expect hidden_dim={self.hidden_dim} at dim 1 or dim -1, got shape {x.shape}")
 
-
-
-class to_channels_first_3d(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x.permute(0, 4, 1, 2, 3).contiguous()
-
-
-class to_channels_last_3d(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x):
-        return x.permute(0, 2, 3, 4, 1).contiguous()
-
-
-class StemLayer3D(nn.Module):
-    """3D Stem layer that preserves spatial and spectral resolution"""
-
-    def __init__(self,
-                 in_chans=1,
-                 out_chans=96,
-                 act_layer='GELU',
-                 norm_layer='BN'):
-        super().__init__()
-        # 使用3D卷积处理光谱-空间立方体
-        self.conv1 = nn.Conv3d(in_chans,
-                               out_chans // 2,
-                               kernel_size=3,
-                               stride=1,
-                               padding=1)
-        self.norm1 = nn.BatchNorm3d(out_chans // 2)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv3d(out_chans // 2,
-                               out_chans,
-                               kernel_size=3,
-                               stride=1,
-                               padding=1)
-        self.norm2 = nn.BatchNorm3d(out_chans)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.norm1(x)
-        x = self.act(x)
-        x = self.conv2(x)
-        x = self.norm2(x)
-        return x
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None,
-                 act_layer=nn.GELU, drop=0., channels_first=True):
-        super().__init__()
-        assert channels_first, "3D MLP must use channels_first=True for (B,C,S,H,W)"
-
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-
-        self.fc1 = nn.Conv3d(in_features, hidden_features, kernel_size=1, bias=True)
-        self.act = act_layer()
-        self.drop = nn.Dropout(drop)
-        self.fc2 = nn.Conv3d(hidden_features, out_features, kernel_size=1, bias=True)
-
-    def forward(self, x):
-        # x: (B, C, S, H, W)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
 
 class FreqBranchAttention(nn.Module):
     """
@@ -856,24 +645,7 @@ class ParallelHeat3DLayer(nn.Module):
 
         return out
 
-
-
-class AdditionalInputSequential(nn.Sequential):
-    def forward(self, x, *args, **kwargs):
-        for module in self[:-1]:
-            if isinstance(module, nn.Module):
-                x = module(x, *args, **kwargs)
-            else:
-                x = module(x)
-        x = self[-1](x)
-        return x
-
-
-
-
-
-
-class Heat3D_Pipeline(nn.Module):
+class MSF_Heat3D(nn.Module):
     """
     (B, H, W, S) 或 (B, S, H, W) ->
       1) 光谱降维 (S -> S')
@@ -1057,7 +829,7 @@ class Heat3D_Pipeline(nn.Module):
             return torch.cat([avg, mx], dim=1)
         raise ValueError(f"未知 freq_pool: {self.freq_pool}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_feat: bool = False) -> torch.Tensor:
         # 形状统一到 (B, H, W, S) 以匹配 reducer
         x_cl = self._to_channels_last_hw_s(x, self.band)
         B, H, W, S = x_cl.shape
@@ -1108,37 +880,19 @@ class Heat3D_Pipeline(nn.Module):
         # 频率融合 -> 2D Head
         x3d = self.spectral_fusion(x3d)  # (B, head_channels, S, H, W)
         x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)，内部会做 freq_fuse
-        logits = self.head(x2d)          # (B, num_classes)
+        #logits = self.head(x2d)          # (B, num_classes)
+        #return logits
+        # 复用 head 的前半段提取 logits 前向量特征
+        # head: Conv2d -> BN -> GELU -> AdaptiveAvgPool2d(1) -> Flatten -> Linear
+        feat = x2d
+        feat = self.head[0](feat)
+        feat = self.head[1](feat)
+        feat = self.head[2](feat)
+        feat = self.head[3](feat)
+        feat_vec = self.head[4](feat)  # (B, head_channels)
+
+        logits = self.head[5](feat_vec)  # Linear
+
+        if return_feat:
+            return logits, feat_vec
         return logits
-
-
-
-
-
-if __name__ == "__main__":
-    from fvcore.nn import flop_count_table, flop_count_str, FlopCountAnalysis
-
-    # 测试3D版本
-    model = Heat3D_Pipeline(band=200, num_classes=16, patch_size=7).cuda()
-
-    # 创建3D输入数据: (B, H, W, C) 格式
-    input = torch.randn((1, 200, 7, 7), device=torch.device('cuda'))
-
-    print("3D vHeat Model for Hyperspectral Classification")
-    print(f"Input shape: {input.shape}")
-
-    # 测试前向传播
-    with torch.no_grad():
-        output = model(input)
-        print(f"Output shape: {output.shape}")
-
-        # 计算FLOPs
-        analyze = FlopCountAnalysis(model, (input,))
-        print("\nFLOPs Analysis:")
-        print(flop_count_str(analyze))
-
-        # 参数统计
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\nTotal parameters: {total_params:,}")
-        print(f"Trainable parameters: {trainable_params:,}")

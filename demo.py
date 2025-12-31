@@ -6,7 +6,7 @@ import torch.backends.cudnn as cudnn
 from scipy.io import savemat
 from torch import optim
 from s2vnet_model import S2VNet
-from vheat3d_model import Heat3D_Pipeline
+from vheat3d_model import MSF_Heat3D
 from utils import AvgrageMeter, accuracy, output_metric, NonZeroClipper, print_args
 from dataset import prepare_dataset
 import numpy as np
@@ -16,7 +16,12 @@ import json
 import pandas as pd
 from datetime import datetime
 import subprocess
-import json
+from ViT import ViT
+from HybridSN import HybridSN
+from morphFormer import MorphFormer
+from ssftt import SSFTT
+from HSI3DCNN import HSI3DCNN
+from fvcore.nn import FlopCountAnalysis
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
@@ -24,7 +29,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet', 'vheat3d','Heat3D_Pipeline'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -179,7 +184,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
             # 🆕 vheat3d 只需要分类损失
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
-        elif args.model_name == 'Heat3D_Pipeline':
+        elif args.model_name == 'MSF_Heat3D':
             # 只需要分类损失
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
@@ -221,7 +226,7 @@ def valid_epoch(model, valid_loader, criterion, optimizer, device):
         elif args.model_name == 'vheat3d':
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
-        elif args.model_name == 'Heat3D_Pipeline':
+        elif args.model_name == 'MSF_Heat3D':
             batch_pred = model(batch_data)
             loss = criterion(batch_pred, batch_target)
         else:
@@ -251,7 +256,7 @@ def test_epoch(model, test_loader, device):
             re_unmix_nonlinear, re_unmix, batch_pred, edm_var_1, edm_var_2, _, _ = model(batch_data)
         elif args.model_name == 'vheat3d':
             batch_pred = model(batch_data)  # 🆕 vheat3d 直接输出分类结果
-        elif args.model_name == 'Heat3D_Pipeline':
+        elif args.model_name == 'MSF_Heat3D':
             batch_pred = model(batch_data)  # 🆕 vheat3d 直接输出分类结果
         else:
             batch_pred = model(batch_data)
@@ -311,13 +316,76 @@ def main():
     # create model
     if args.model_name == 's2vnet':
         model = S2VNet(band, num_classes, args.patches)
-    elif args.model_name == 'Heat3D_Pipeline':
-        model = Heat3D_Pipeline(band, num_classes, args.patches, dataset_name=args.dataset,)
+    elif args.model_name == 'MSF_Heat3D':
+        model = MSF_Heat3D(band, num_classes, args.patches, dataset_name=args.dataset,)
+    elif args.model_name == 'HybridSN':
+        # 与其他模型相同的接口: (band, num_classes, patches)
+        model = HybridSN(band, num_classes, args.patches)
+    elif args.model_name == 'ViT':
+        # 这里 img_size 使用 HSI patch 的空间尺寸 args.patches
+        # vit_patch_size 可以先设为 1，表示整个 HSI patch 视作一个 "token 网格"
+        model = ViT(
+            band=band,
+            num_classes=num_classes,
+            img_size=args.patches,
+            vit_patch_size=1,   # 若想划分更多 patch，可改为 2, 3 等，需保证能整除 img_size
+            embed_dim=192,
+            depth=6,
+            num_heads=3,
+        )
+    elif args.model_name == 'MorphFormer':
+        # 这里 patch_size 使用 args.patches，与数据预处理保持一致
+        model = MorphFormer(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            fm=16,  # 可按原始代码调整
+            hsi_only=False  # 若原实现始终采用 False，则保持 False
+        )
+    elif args.model_name == 'SSFTT':
+        model = SSFTT(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            num_tokens=4,  # 可按论文或需要调整
+            dim=64,
+            depth=1,
+            heads=8,
+            mlp_dim=128,
+            dropout=0.1,
+            emb_dropout=0.1,
+        )
+    elif args.model_name == 'HSI3DCNN':
+        # 标准 3D-CNN 模型
+        model = HSI3DCNN(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches
+        )
     else:
         raise KeyError("{} model is unknown.".format(args.model_name))
     model = model.to(device)
+    # \* 统计并打印当前模型参数量（单位：K）
+    total_params = sum(p.numel() for p in model.parameters())
+    total_params_k = total_params / 1e3
     print("Model Name: {}".format(args.model_name))
+    print("Total Params: {:.2f}K ({:,} parameters)".format(total_params_k, total_params))
+    # \* 统计并打印当前模型计算量（MACs/FLOPs）
+    # 构造一个与训练数据一致的单个样本形状的 dummy 输入
+    if args.model_name == 'MSF_Heat3D':
+        dummy_input = torch.randn(1, band, args.patches, args.patches, device=device)
+    elif args.model_name == 's2vnet':
+        # 根据 S2VNet 实际输入格式调整，这里假设为 (B, band, H, W)
+        dummy_input = torch.randn(1, band, args.patches, args.patches, device=device)
+    else:
+        dummy_input = torch.randn(1, band, args.patches, args.patches, device=device)
 
+    model.eval()
+    with torch.no_grad():
+        flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
+        macs = flops_analyzer.total()  # 单位：FLOPs \(\~= MACs\)
+    macs_g = macs / 1e6
+    print("Total MACs: {:.2f} M".format(macs_g))
     # criterion
     criterion = nn.CrossEntropyLoss().to(device)
     # Set the optimizer
@@ -334,14 +402,7 @@ def main():
     if args.flag_test == 'test':
         print("🚀 Start testing...")
         model.eval()
-        # 🆕 添加 Houston 数据集测试阶段的兼容性检查
-        if args.dataset == 'Houston':
-            print("🧪 Houston 测试阶段：使用 Houston 2018 数据集进行测试")
-            # 检查测试集是否有样本
-            if len(label_test_loader.dataset) == 0:
-                print("⚠️ 测试阶段：测试集为空，使用全图数据进行测试")
-            else:
-                print(f"✅ 测试集样本数: {len(label_test_loader.dataset)}")
+        ts_start = time.time()
 
         # ✅ 自动选择模型权重路径（根据当前数据集）
         branch_name = get_git_branch_name()
@@ -392,7 +453,7 @@ def main():
                         _, _, batch_pred, _, _, _, _ = model(x_tensor)
                     elif args.model_name == 'vheat3d':
                         batch_pred = model(x_tensor)  # 🆕 vheat3d 直接输出分类结果
-                    elif args.model_name == 'Heat3D_Pipeline':
+                    elif args.model_name == 'MSF_Heat3D':
                         batch_pred = model(x_tensor)  # 直接输出分类结果
                     else:
                         batch_pred = model(x_tensor)
@@ -455,6 +516,9 @@ def main():
             json.dump(metrics, f, indent=4)
 
         print(f"📊 测试指标已保存为 JSON 文件：{results_json_path}")
+        ts_end = time.time()
+        ts_time = ts_end - ts_start
+        print("TS Time (total test): {:.4f} s".format(ts_time))
 
     else:
         print("start training")
