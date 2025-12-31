@@ -1,39 +1,59 @@
-# MSF\_Heat3D
+VHEAT3D 项目使用指南
+环境配置
+1. 基础环境
 
-简要描述：本项目用于 \[一句话概述任务/方法\]，提供训练与测试脚本，并支持在 \[数据集名\] 上复现实验结果。
+    Python 3.9
 
-## 目录
-\- \[项目简介\](#项目简介)  
-\- \[环境要求\](#环境要求)  
-\- \[安装\](#安装)  
-\- \[数据准备\](#数据准备)  
-\- \[快速开始\](#快速开始)  
-\- \[训练\](#训练)  
-\- \[测试/推理\](#测试推理)  
-\- \[参数说明\](#参数说明)  
-\- \[复现性\](#复现性)  
-\- \[常见问题\](#常见问题)  
-\- \[项目结构\](#项目结构)  
-\- \[引用与致谢\](#引用与致谢)  
-\- \[许可证\](#许可证)
+    安装依赖包：
 
-## 项目简介
-\- 方法：`MSF\_Heat3D`（\*补充核心思路/亮点\*）  
-\- 任务：\*补充任务类型，例如分类/分割/重建等\*  
-\- 支持数据集：例如 `Indian`（\*列出更多\*）
+bash
 
-## 环境要求
-\- OS：Linux  
-\- Python：python=3.9
-\- 依赖管理：pip  
-\- GPU：\*可选，写明 CUDA/cuDNN 版本范围\*
-
-> 说明：项目内的 `run_test.sh` 会从 `LD_LIBRARY_PATH` 中移除 `/usr/local/cuda-12.4/lib64`，用于避免加载到不匹配的 cuDNN/CUDA 动态库（在多 CUDA 版本并存时有用）。
-
-## 安装
-```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
 pip install -r requirements.txt
 
+数据准备
+1. 下载数据集
+
+下载项目所需的数据集文件。
+2. 目录设置
+
+    在项目根目录下创建 data 文件夹：
+
+bash
+
+mkdir data
+
+    将数据集文件解压后放入 data 文件夹，确保文件路径为：
+
+text
+
+data/IndianPine.mat
+
+项目结构
+主要代码文件
+
+    vheat3d_model.py - 模型定义文件
+
+    demo.py - 演示代码
+
+    dataset.py - 数据集处理模块
+
+    util.py - 工具函数模块
+
+使用方法
+训练模型
+bash
+
+# 添加执行权限
+chmod +x run_train.sh
+
+# 运行训练脚本
+./run_train.sh
+
+测试模型
+bash
+
+# 添加执行权限
+chmod +x run_test.sh
+
+# 运行测试脚本
+./run_test.sh
