@@ -24,7 +24,7 @@
 
 ## 环境要求
 \- OS：Linux  
-\- Python：\*建议写明版本，例如 3\.9/3\.10\*  
+\- Python：python=3.9
 \- 依赖管理：pip  
 \- GPU：\*可选，写明 CUDA/cuDNN 版本范围\*
 
