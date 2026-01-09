@@ -748,7 +748,8 @@ class MSF_Heat3D(nn.Module):
             heat_block_cls=Heat3D,
             channels=heat_hidden_dim,
             num_branches=3,
-            freq_config="low_mid_high" # “low" "mid" "high"
+            freq_config="low_mid_high", # “low" "mid" "high"
+            parallel_cfg=self.parallel_cfg,  #关键：把数据集专属配置传进去
         )
         self.second_norm = LayerNorm3d(heat_hidden_dim) if use_post_norm else nn.Identity()
 

@@ -1,15 +1,12 @@
 import os
 import argparse
 from typing import Optional
+
 import numpy as np
 import scipy.io as sio
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
-import torch
-import torch.nn.functional as F
-from vheat3d_model import MSF_Heat3D
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 INDIAN_PINES_COLORS = np.array(
     [[c / 256.0 for c in color] for color in [
@@ -89,12 +86,14 @@ DATASET_ALIASES = {
     "augsburg": ["augsburg"],
 }
 
+
 def normalize_hsi(hsi: np.ndarray):
     band_min = hsi.min(axis=(0, 1), keepdims=True)
     band_max = hsi.max(axis=(0, 1), keepdims=True)
     denom = np.clip(band_max - band_min, a_min=1e-6, a_max=None)
     return np.clip((hsi - band_min) / denom, 0.0, 1.0)
 
+#indian数据集使用这个build_fasle_color函数效果更好
 def build_false_color(hsi: np.ndarray, bands=(30, 20, 10)):
     b0, b1, b2 = [min(idx, hsi.shape[2] - 1) for idx in bands]
     rgb = np.stack([hsi[:, :, b0], hsi[:, :, b1], hsi[:, :, b2]], axis=-1)
@@ -102,6 +101,21 @@ def build_false_color(hsi: np.ndarray, bands=(30, 20, 10)):
     rgb_max = rgb.max(axis=(0, 1), keepdims=True)
     denom = np.clip(rgb_max - rgb_min, a_min=1e-6, a_max=None)
     return np.clip((rgb - rgb_min) / denom, 0.0, 1.0)
+
+#其余数据集使用这个build_false_color函数效果更好
+"""
+def build_false_color(hsi: np.ndarray, bands=(30, 20, 10), p_low: float = 2.0, p_high: float = 98.0):
+    b0, b1, b2 = [min(idx, hsi.shape[2] - 1) for idx in bands]
+    rgb = np.stack([hsi[:, :, b0], hsi[:, :, b1], hsi[:, :, b2]], axis=-1).astype(np.float32)
+
+    lo = np.percentile(rgb, p_low, axis=(0, 1), keepdims=True)
+    hi = np.percentile(rgb, p_high, axis=(0, 1), keepdims=True)
+    denom = np.clip(hi - lo, a_min=1e-6, a_max=None)
+
+    rgb = (rgb - lo) / denom
+    return np.clip(rgb, 0.0, 1.0)
+"""
+
 
 def infer_dataset_key(data_path: str, dataset_hint: Optional[str] = None) -> str:
     candidates = ([dataset_hint] if dataset_hint else []) + os.path.normpath(data_path).split(os.sep)
@@ -115,6 +129,7 @@ def infer_dataset_key(data_path: str, dataset_hint: Optional[str] = None) -> str
                 return key
     return "indian"
 
+
 def load_split_mat_dataset(root_dir: str):
     parts = {
         "cube": os.path.join(root_dir, "data_HS_LR.mat"),
@@ -125,26 +140,28 @@ def load_split_mat_dataset(root_dir: str):
         if not os.path.isfile(path):
             raise FileNotFoundError(f"{label} 文件缺失: {path}")
     hsi = normalize_hsi(sio.loadmat(parts["cube"])["data_HS_LR"].astype(np.float32))
-    TR = sio.loadmat(parts["train"])["TrainImage"].astype(np.int32)
-    TE = sio.loadmat(parts["test"])["TestImage"].astype(np.int32)
-    gt = np.where(TR != 0, TR, TE)
+    tr = sio.loadmat(parts["train"])["TrainImage"].astype(np.int32)
+    te = sio.loadmat(parts["test"])["TestImage"].astype(np.int32)
+    gt = np.where(tr != 0, tr, te)
     num_classes = int(gt.max())
     if num_classes <= 0:
         raise ValueError(f"{root_dir} 未检测到有效类别。")
-    return hsi, TR, TE, gt, num_classes
+    return hsi, tr, te, gt, num_classes
+
 
 def load_single_mat_dataset(mat_path: str):
     if not os.path.isfile(mat_path):
         raise FileNotFoundError(f"{mat_path} 不是有效的 .mat 文件")
     data = sio.loadmat(mat_path)
     hsi = normalize_hsi(data["input"].astype(np.float32))
-    TR = data["TR"].astype(np.int32)
-    TE = data["TE"].astype(np.int32)
-    gt = np.where(TR != 0, TR, TE)
+    tr = data["TR"].astype(np.int32)
+    te = data["TE"].astype(np.int32)
+    gt = np.where(tr != 0, tr, te)
     num_classes = int(gt.max())
     if num_classes <= 0:
         raise ValueError(f"{mat_path} 未检测到有效类别。")
-    return hsi, TR, TE, gt, num_classes
+    return hsi, tr, te, gt, num_classes
+
 
 def load_hsi_dataset(data_path: str, dataset_key: Optional[str] = None):
     dataset_key = (dataset_key or infer_dataset_key(data_path)).lower()
@@ -153,6 +170,7 @@ def load_hsi_dataset(data_path: str, dataset_key: Optional[str] = None):
         root_dir = root_dir or "."
         return load_split_mat_dataset(root_dir)
     return load_single_mat_dataset(data_path)
+
 
 def select_class_colors(dataset_key: str):
     dataset_key = (dataset_key or "").lower()
@@ -165,78 +183,7 @@ def select_class_colors(dataset_key: str):
     # 默认 indian
     return INDIAN_PINES_COLORS
 
-def build_model(band: int, num_classes: int, patch_size: int, ckpt_path: str, *,
-                reduced_bands=24, heat_hidden_dim=64,
-                head_channels=128, reducer_type="learnable", pca_path: Optional[str] = None,
-                freq_pool="avgmax", use_post_norm=True,dataset_name: str):
-    pca_tensor = None
-    if reducer_type == "pca":
-        if not pca_path:
-            raise ValueError("PCA 模式需要提供 --pca_path。")
-        pca_tensor = torch.from_numpy(np.load(pca_path)).float()
-    model = MSF_Heat3D(
-        band=band,
-        num_classes=num_classes,
-        patches=patch_size,
-        reduced_bands=24,
-        heat_hidden_dim=48,
-        head_channels=128,
-        reducer_type="learnable",
-        pca_P=pca_tensor,
-        use_checkpoint=False,
-        freq_pool=freq_pool,
-        use_post_norm=use_post_norm,
-        use_multiscale=True,  # \* 根据你当前 Heat3D_Pipeline 默认使用多尺度
-        dataset_name=dataset_name,
-    )
-    if os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location="cpu")
-        state = state.get("state_dict", state)
-        state = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
-        model.load_state_dict(state, strict=False)
-        print(f"loaded checkpoint from {ckpt_path}")
-    else:
-        print(f"warning: checkpoint {ckpt_path} not found, use randomly initialized weights")
-    model.eval()
-    model.to(DEVICE)
-    return model
 
-def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: int,
-                           num_classes: int, band: int, batch_size: int = 512):
-    H, W, S = hsi.shape
-    assert S == band, f"band mismatch: HSI has {S}, model expects {band}"
-    pad = patch_size // 2
-    hsi_pad = np.pad(hsi, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
-    pred_score_sum = np.zeros((H, W, num_classes), dtype=np.float32)
-    pred_count = np.zeros((H, W), dtype=np.float32)
-    device = next(model.parameters()).device
-    patches, coords = [], []
-
-    def flush_batch():
-        if not patches:
-            return
-        batch = torch.from_numpy(np.stack(patches).astype(np.float32)).to(device)
-        with torch.no_grad():
-            probs = F.softmax(model(batch), dim=1).cpu().numpy()
-        for (h_idx, w_idx), prob in zip(coords, probs):
-            pred_score_sum[h_idx, w_idx] += prob
-            pred_count[h_idx, w_idx] += 1.0
-        patches.clear()
-        coords.clear()
-
-    for i in range(H):
-        for j in range(W):
-            i_pad, j_pad = i + pad, j + pad
-            patch = hsi_pad[i_pad - pad:i_pad + pad + 1, j_pad - pad:j_pad + pad + 1, :]
-            if patch.shape[:2] != (patch_size, patch_size):
-                continue
-            patches.append(patch)
-            coords.append((i, j))
-            if len(patches) == batch_size:
-                flush_batch()
-    flush_batch()
-    avg_scores = pred_score_sum / np.clip(pred_count[:, :, None], a_min=1.0, a_max=None)
-    return np.argmax(avg_scores, axis=-1).astype(np.int32)
 
 def build_class_colormap(num_classes: int, background_color=(0, 0, 0), class_colors=None):
     colors = [background_color]
@@ -248,72 +195,53 @@ def build_class_colormap(num_classes: int, background_color=(0, 0, 0), class_col
     norm = BoundaryNorm(np.arange(-0.5, num_classes + 1.5, 1.0), cmap.N)
     return cmap, norm
 
-def save_pred_only(pred: np.ndarray, dataset_name: str, save_dir: str, num_classes: int, class_colors):
-    os.makedirs(save_dir, exist_ok=True)
-    safe_name = dataset_name.lower().replace(" ", "_")
-    # title_prefix = dataset_name.replace("_", " ")  # \u5982\u679c\u4e0d\u7528\u6807\u9898\uff0c\u53ef\u4ee5\u4e0d\u9700\u8981
 
-    cmap, norm = build_class_colormap(num_classes, class_colors=class_colors)
-
+def save_image(fig_data: np.ndarray, title: str, out_path: str, cmap=None, norm=None,show_title: bool = False):
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     plt.figure(figsize=(5, 5))
-    plt.imshow(pred, cmap=cmap, norm=norm)
+    plt.imshow(fig_data, cmap=cmap, norm=norm)
     plt.axis("off")
-    # plt.title(f"{title_prefix} Heat3D_Pipeline Prediction")  # \u5220\u9664\u6216\u6ce8\u91ca\uff0c\u53bb\u6389\u6807\u9898
-    plt.savefig(os.path.join(save_dir, f"{safe_name}_pred.png"), dpi=300, bbox_inches="tight")
+    if show_title and title:
+        plt.title(title)
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"saved pred figure to {save_dir}")
-
-
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize HSI predictions.")
+    parser = argparse.ArgumentParser(description="Visualize HSI: false color and GT only.")
     parser.add_argument("--data_path", default="./data/IndianPine.mat")
-    parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--dataset_name", default=None)
-    parser.add_argument("--patch_size", type=int, default=7)
-    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--output_dir", default="./results/vis_results")
     parser.add_argument("--false_color_bands", nargs=3, type=int, default=(30, 20, 10))
-    parser.add_argument("--reduced_bands", type=int, default=24)
-    parser.add_argument("--heat_hidden_dim", type=int, default=64)
-    parser.add_argument("--head_channels", type=int, default=128)
-    parser.add_argument("--reducer_type", choices=["learnable", "pca"], default="learnable")
-    parser.add_argument("--pca_path", default=None)
-    parser.add_argument("--freq_pool", choices=["avg", "max", "avgmax"], default="avgmax")
-    parser.add_argument("--disable_post_norm", action="store_true")
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)
     dataset_name = (args.dataset_name or dataset_key.capitalize()).replace(".mat", "")
-    hsi, TR, TE, gt, num_classes = load_hsi_dataset(args.data_path, dataset_key)
+    safe_name = dataset_name.lower().replace(" ", "_")
+    title_prefix = dataset_name.replace("_", " ")
+
+    hsi, _tr, _te, gt, num_classes = load_hsi_dataset(args.data_path, dataset_key)
+    false_color = build_false_color(hsi, bands=tuple(args.false_color_bands))
 
     class_colors = select_class_colors(dataset_key)
-    model = build_model(
-        band=hsi.shape[2],
-        num_classes=num_classes,
-        patch_size=args.patch_size,
-        ckpt_path=args.ckpt_path,
-        reduced_bands=args.reduced_bands,
-        heat_hidden_dim=args.heat_hidden_dim,
-        head_channels=args.head_channels,
-        reducer_type=args.reducer_type,
-        pca_path=args.pca_path,
-        freq_pool=args.freq_pool,
-        use_post_norm=not args.disable_post_norm,
-        dataset_name=dataset_name,
+    cmap, norm = build_class_colormap(num_classes, class_colors=class_colors)
+
+    save_image(
+        false_color,
+        f"{title_prefix} False Color",
+        os.path.join(args.output_dir, f"{safe_name}_false_color.png"),
+        cmap=None,
+        norm=None,
     )
-    pred_map = sliding_window_predict(
-        hsi=hsi,
-        model=model,
-        patch_size=args.patch_size,
-        num_classes=num_classes,
-        band=hsi.shape[2],
-        batch_size=args.batch_size,
+    save_image(
+        gt,
+        f"{title_prefix} Ground Truth",
+        os.path.join(args.output_dir, f"{safe_name}_gt.png"),
+        cmap=cmap,
+        norm=norm,
     )
-    pred_vis =  pred_map + 1
-    save_pred_only(pred_vis, dataset_name,
-                 args.output_dir, num_classes, class_colors, )
+    print(f"saved figures to {args.output_dir}")
+
 
 if __name__ == "__main__":
     main()
