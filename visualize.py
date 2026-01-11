@@ -8,6 +8,10 @@ from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import torch.nn.functional as F
 from vheat3d_model import MSF_Heat3D
+from DSNet import DSNet
+from MASSFormer import MASSFormer
+from SiT import SiT
+from HSI2DCNN import HSI2DCNN
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -165,38 +169,58 @@ def select_class_colors(dataset_key: str):
     # 默认 indian
     return INDIAN_PINES_COLORS
 
-def build_model(band: int, num_classes: int, patch_size: int, ckpt_path: str, *,
-                reduced_bands=24, heat_hidden_dim=64,
-                head_channels=128, reducer_type="learnable", pca_path: Optional[str] = None,
-                freq_pool="avgmax", use_post_norm=True,dataset_name: str):
-    pca_tensor = None
-    if reducer_type == "pca":
-        if not pca_path:
-            raise ValueError("PCA 模式需要提供 --pca_path。")
-        pca_tensor = torch.from_numpy(np.load(pca_path)).float()
-    model = MSF_Heat3D(
-        band=band,
-        num_classes=num_classes,
-        patches=patch_size,
-        reduced_bands=24,
-        heat_hidden_dim=48,
-        head_channels=128,
-        reducer_type="learnable",
-        pca_P=pca_tensor,
-        use_checkpoint=False,
-        freq_pool=freq_pool,
-        use_post_norm=use_post_norm,
-        use_multiscale=True,  # \* 根据你当前 Heat3D_Pipeline 默认使用多尺度
-        dataset_name=dataset_name,
-    )
-    if os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location="cpu")
-        state = state.get("state_dict", state)
-        state = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
-        model.load_state_dict(state, strict=False)
-        print(f"loaded checkpoint from {ckpt_path}")
+def build_model(
+    band: int,
+    num_classes: int,
+    patch_size: int,
+    ckpt_path: str,
+    *,
+    model_name: str = "MSF_Heat3D",
+    reduced_bands=24,
+    heat_hidden_dim=64,
+    head_channels=128,
+    reducer_type="learnable",
+    pca_path: Optional[str] = None,
+    freq_pool="avgmax",
+    use_post_norm=True,
+    dataset_name: str,
+):
+    """
+    返回一个可直接前向输出 logits 的模型（B, num_classes）。
+    """
+    model_name = (model_name or "").lower()
+
+    if model_name in {"dsnet"}:
+        # DSNet: 你的 DSNet.py 已经兼容 (band, num_classes, patch_size)
+        model = DSNet(band, num_classes, patch_size)
+    elif model_name in {"massformer"}:
+        # 接口与 demo.py 对齐：MASSFormer(band, num\_classes, patch\_size)
+        model = MASSFormer(band, num_classes, patch_size)
+    elif model_name == "sit":
+        model = SiT(band, num_classes, patch_size)
+    elif model_name == "hsi2dcnn":
+        model = HSI2DCNN(band, num_classes, patch_size)
+    elif model_name in {"msf_heat3d", "msf-heat3d", "heat3d", "vheat3d"}:
+        pca_tensor = None
+        if reducer_type == "pca":
+            # 若你原本这里有 PCA 加载逻辑，保持不变
+            pass
+
+        model = MSF_Heat3D(
+            band,
+            num_classes,
+            patch_size,
+            dataset_name=dataset_name,
+        )
     else:
-        print(f"warning: checkpoint {ckpt_path} not found, use randomly initialized weights")
+        raise KeyError(f"unknown model_name: {model_name}")
+
+    if os.path.isfile(ckpt_path):
+        state = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(state, strict=True)
+    else:
+        raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
+
     model.eval()
     model.to(DEVICE)
     return model
@@ -211,7 +235,7 @@ def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: 
     pred_count = np.zeros((H, W), dtype=np.float32)
     device = next(model.parameters()).device
     patches, coords = [], []
-
+    """
     def flush_batch():
         if not patches:
             return
@@ -221,6 +245,28 @@ def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: 
         for (h_idx, w_idx), prob in zip(coords, probs):
             pred_score_sum[h_idx, w_idx] += prob
             pred_count[h_idx, w_idx] += 1.0
+        patches.clear()
+        coords.clear()
+    """
+
+    def flush_batch():
+        if not patches:
+            return
+
+        # patches: List[np.ndarray]，每个元素形状应为 (patch_size, patch_size, band)
+        batch_np = np.stack(patches, axis=0).astype(np.float32)  # (B, H, W, C)
+        batch_np = batch_np.transpose(0, 3, 1, 2).copy()  # (B, C, H, W)
+
+        batch = torch.from_numpy(batch_np).to(device)
+
+        with torch.no_grad():
+            logits = model(batch)  # (B, num_classes)
+            probs = F.softmax(logits, dim=1).cpu().numpy()
+
+        for (h_idx, w_idx), prob in zip(coords, probs):
+            pred_score_sum[h_idx, w_idx] += prob
+            pred_count[h_idx, w_idx] += 1.0
+
         patches.clear()
         coords.clear()
 
@@ -271,7 +317,7 @@ def main():
     parser.add_argument("--data_path", default="./data/IndianPine.mat")
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--dataset_name", default=None)
-    parser.add_argument("--patch_size", type=int, default=7)
+    parser.add_argument("--patch_size", type=int, default=9)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--output_dir", default="./results/vis_results")
     parser.add_argument("--false_color_bands", nargs=3, type=int, default=(30, 20, 10))
@@ -282,6 +328,7 @@ def main():
     parser.add_argument("--pca_path", default=None)
     parser.add_argument("--freq_pool", choices=["avg", "max", "avgmax"], default="avgmax")
     parser.add_argument("--disable_post_norm", action="store_true")
+    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "MASSFormer", "SiT", "HSI2DCNN"], default="MSF_Heat3D")
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)
@@ -295,6 +342,7 @@ def main():
         patch_size=args.patch_size,
         ckpt_path=args.ckpt_path,
         reduced_bands=args.reduced_bands,
+        model_name=args.model_name,
         heat_hidden_dim=args.heat_hidden_dim,
         head_channels=args.head_channels,
         reducer_type=args.reducer_type,

@@ -21,6 +21,10 @@ from HybridSN import HybridSN
 from morphFormer import MorphFormer
 from ssftt import SSFTT
 from HSI3DCNN import HSI3DCNN
+from DSNet import DSNet
+from MASSFormer import MASSFormer
+from SiT import SiT
+from HSI2DCNN import HSI2DCNN
 from fvcore.nn import FlopCountAnalysis
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
@@ -29,7 +33,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -321,6 +325,14 @@ def main():
     elif args.model_name == 'HybridSN':
         # 与其他模型相同的接口: (band, num_classes, patches)
         model = HybridSN(band, num_classes, args.patches)
+    elif args.model_name == "DSNet":
+        model = DSNet(band, num_classes, args.patches)
+    elif args.model_name == "MASSFormer":
+        model = MASSFormer(band, num_classes, args.patches)
+    elif args.model_name == "SiT":
+        model = SiT(band, num_classes, args.patches)
+    elif args.model_name == "HSI2DCNN":
+        model = HSI2DCNN(band, num_classes, args.patches)
     elif args.model_name == 'ViT':
         # 这里 img_size 使用 HSI patch 的空间尺寸 args.patches
         # vit_patch_size 可以先设为 1，表示整个 HSI patch 视作一个 "token 网格"
