@@ -25,8 +25,11 @@ from DSNet import DSNet
 from MASSFormer import MASSFormer
 from SiT import SiT
 from HSI2DCNN import HSI2DCNN
+from MambaHSI.MambaHSI import MambaHSIClassifier
+from VisionMamba.VMamba import VisionMambaClassifier
 from fvcore.nn import FlopCountAnalysis
-from vHeat import vHeatHSI
+from S2Mamba import S2Mamba
+from vHeat import S2VHeat
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
@@ -34,7 +37,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'vHeatHSI'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'MambaHSI', 'VMamba', 'S2Mamba'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -334,8 +337,46 @@ def main():
         model = SiT(band, num_classes, args.patches)
     elif args.model_name == "HSI2DCNN":
         model = HSI2DCNN(band, num_classes, args.patches)
-    elif args.model_name == "vHeatHSI":
-        model = vHeatHSI(band, num_classes, args.patches)
+    elif args.model_name == "vHeat":
+        model = S2VHeat(band, num_classes, args.patches)
+    elif args.model_name == "MambaHSI":
+        model = MambaHSIClassifier(
+            band=band,
+            num_classes=num_classes,
+            hidden_dim=128,
+            mamba_type="both",
+            token_num=4,
+            group_num=4,
+            use_residual=True,
+            use_att=True,
+            pool="gap",
+        )
+    elif args.model_name == "VMamba":
+        model = VisionMambaClassifier(
+            band=band,
+            num_classes=num_classes,
+            img_size=args.patches,  # 与当前 patch 裁剪尺寸一致
+            embed_dim=128,
+            depth=8,
+            d_state=8,
+            drop_path_rate=0.6,
+            if_abs_pos_embed=True,
+            if_rope=False,
+            if_cls_token=True,
+            use_middle_cls_token=True,
+        )
+    elif args.model_name == "S2Mamba":
+        model = S2Mamba(
+            patch=args.patches,  # patch 尺寸
+            in_chans=band,  # HSI 波段数
+            num_classes=num_classes,  # 类别数
+            depths=[1],  # 先用最小配置跑通
+            dims=[64],  # hidden dim
+            d_state=16,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+        )
     elif args.model_name == 'ViT':
         # 这里 img_size 使用 HSI patch 的空间尺寸 args.patches
         # vit_patch_size 可以先设为 1，表示整个 HSI patch 视作一个 "token 网格"
@@ -396,11 +437,18 @@ def main():
         dummy_input = torch.randn(1, band, args.patches, args.patches, device=device)
 
     model.eval()
-    with torch.no_grad():
-        flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
-        macs = flops_analyzer.total()  # 单位：FLOPs \(\~= MACs\)
-    macs_g = macs / 1e6
-    print("Total MACs: {:.2f} M".format(macs_g))
+    # VMamba 会触发 mamba_ssm 的 Triton layer norm 编译，fvcore trace 阶段可能直接报错
+    if args.model_name == "VMamba":
+        print("Skip MACs/FLOPs for VMamba (Triton kernel is not trace-friendly under fvcore).")
+    else:
+        try:
+            with torch.no_grad():
+                flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
+                macs = flops_analyzer.total()  # 单位: FLOPs (\~= MACs)
+            macs_g = macs / 1e6
+            print("Total MACs: {:.2f} M".format(macs_g))
+        except Exception as e:
+            print(f"Skip MACs/FLOPs due to analysis error: {type(e).__name__}: {e}")
     # criterion
     criterion = nn.CrossEntropyLoss().to(device)
     # Set the optimizer

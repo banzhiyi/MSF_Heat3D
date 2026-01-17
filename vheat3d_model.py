@@ -542,6 +542,7 @@ class ParallelHeat3DLayer(nn.Module):
         """
         super().__init__()
         self.num_branches = num_branches
+        self.freq_config = freq_config  # 保存下来，便于核对
         inner_dim = inner_dim or channels // 2
         # 保存配置（带默认值）
         cfg = parallel_cfg or {}
@@ -562,11 +563,13 @@ class ParallelHeat3DLayer(nn.Module):
             base_freq_modes = ["mid", "high", "high"]
         elif freq_config == "low_mid_high":
             base_freq_modes = ["low", "mid", "high"]
+        elif freq_config == "low_high":
+            base_freq_modes = ["low", "high", "high"]
         else:
             raise ValueError(f"未知 freq_config: {freq_config}")
 
         freq_modes = base_freq_modes[:num_branches]
-
+        self.freq_modes = freq_modes  # ✅ 关键修复: 保存为成员变量，供 forward 使用
         self.branches = nn.ModuleList()
         for m in freq_modes:
             self.branches.append(
@@ -628,17 +631,20 @@ class ParallelHeat3DLayer(nn.Module):
         mask_high = eps_high + (1.0 - eps_high) * mask_high # 高频区域 ~1，其余 ~eps_high
 
         # reshape 成 (1,1,S,H,W)，后面在 Heat3D 内 broadcast 到 (B,C,S,H,W)
-        mask_low = mask_low.view(1, 1, S, H, W)
-        mask_mid = mask_mid.view(1, 1, S, H, W)
-        mask_high = mask_high.view(1, 1, S, H, W)
+        mask_map = {
+            "low": mask_low.view(1, 1, S, H, W),
+            "mid": mask_mid.view(1, 1, S, H, W),
+            "high": mask_high.view(1, 1, S, H, W),
+        }
 
-        # 假设 num_branches == 3 且 freq_config == "low_mid_high"
-        out_low = self.branches[0](x, freq_embed_parallel, freq_mask=mask_low)
-        out_mid = self.branches[1](x, freq_embed_parallel, freq_mask=mask_mid)
-        out_high = self.branches[2](x, freq_embed_parallel, freq_mask=mask_high)
+        # ----- 动态跑 num_branches 个分支 -----
+        feats = []
+        for i, mode in enumerate(self.freq_modes):
+            freq_mask = mask_map[mode]
+            feats.append(self.branches[i](x, freq_embed_parallel, freq_mask=freq_mask))
 
         # 频率自适应融合，仍然是 \[B, inner_dim, S, H, W]
-        out = self.fuse([out_low, out_mid, out_high])
+        out = self.fuse(feats)  # [B, inner_dim, S, H, W]
 
         # 使用 1x1x1 Conv3d 把 inner_dim 投回 channels，保持与输入一致
         out = self.proj(out)  # 形状变为 \[B, channels, S, H, W]

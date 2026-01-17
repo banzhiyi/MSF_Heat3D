@@ -7,11 +7,16 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import torch.nn.functional as F
+
+
+from vHeat import S2VHeat
 from vheat3d_model import MSF_Heat3D
 from DSNet import DSNet
 from MASSFormer import MASSFormer
 from SiT import SiT
 from HSI2DCNN import HSI2DCNN
+from vHeat import S2VHeat
+from VisionMamba.VMamba import VisionMambaClassifier
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -200,6 +205,22 @@ def build_model(
         model = SiT(band, num_classes, patch_size)
     elif model_name == "hsi2dcnn":
         model = HSI2DCNN(band, num_classes, patch_size)
+    elif model_name == "vheat":
+        model = S2VHeat(band, num_classes, patch_size)
+    elif model_name == "vmamba":
+        model = VisionMambaClassifier(
+            band=band,
+            num_classes=num_classes,
+            img_size=patch_size,  # 与当前 patch 裁剪尺寸一致
+            embed_dim=128,
+            depth=8,
+            d_state=8,
+            drop_path_rate=0.6,
+            if_abs_pos_embed=True,
+            if_rope=False,
+            if_cls_token=True,
+            use_middle_cls_token=True,
+        )
     elif model_name in {"msf_heat3d", "msf-heat3d", "heat3d", "vheat3d"}:
         pca_tensor = None
         if reducer_type == "pca":
@@ -328,7 +349,7 @@ def main():
     parser.add_argument("--pca_path", default=None)
     parser.add_argument("--freq_pool", choices=["avg", "max", "avgmax"], default="avgmax")
     parser.add_argument("--disable_post_norm", action="store_true")
-    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "MASSFormer", "SiT", "HSI2DCNN"], default="MSF_Heat3D")
+    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "MASSFormer", "SiT", "HSI2DCNN", "vHeat", "VMamba"], default="MSF_Heat3D")
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)
