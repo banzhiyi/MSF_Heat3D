@@ -889,7 +889,7 @@ class MSF_Heat3D(nn.Module):
         x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)，内部会做 freq_fuse
         #logits = self.head(x2d)          # (B, num_classes)
         #return logits
-        # 复用 head 的前半段提取 logits 前向量特征
+        # 复用 head 的前半段提取 logits 前向量特征,为了t-SNE可视化
         # head: Conv2d -> BN -> GELU -> AdaptiveAvgPool2d(1) -> Flatten -> Linear
         feat = x2d
         feat = self.head[0](feat)

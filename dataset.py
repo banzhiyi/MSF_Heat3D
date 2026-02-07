@@ -5,6 +5,41 @@ import numpy as np
 import os
 import h5py
 from sklearn.decomposition import PCA
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+def _get_pca_cache_path(args, n_components, whiten):
+    # 存到 results 下，按 数据集/模型/参数 区分，避免串用
+    os.makedirs("./results/pca", exist_ok=True)
+    return f"./results/pca/{args.dataset}_{args.model_name}_nc{n_components}_w{int(bool(whiten))}.joblib"
+
+def _pca_fit_or_load_transform(X, args, n_components, whiten):
+    """
+    X: (N, C) 的二维数组
+    优先加载已保存 PCA；否则 fit 并保存，然后 transform
+    """
+    pca_path = _get_pca_cache_path(args, n_components, whiten)
+
+    if joblib is None:
+        # joblib 不可用就退化为原逻辑（不保存）
+        pca = PCA(n_components=n_components, whiten=whiten)
+        return pca.fit_transform(X)
+
+    if os.path.exists(pca_path):
+        pca = joblib.load(pca_path)
+        # 基本一致性校验，避免误加载
+        if getattr(pca, "n_components_", None) != n_components or getattr(pca, "whiten", None) != whiten:
+            raise ValueError(f"PCA 缓存文件参数不匹配: `{pca_path}`")
+        return pca.transform(X)
+
+    pca = PCA(n_components=n_components, whiten=whiten)
+    X_pca = pca.fit_transform(X)
+    joblib.dump(pca, pca_path)
+    print(f"✅ 已保存 PCA 到: `{pca_path}`")
+    return X_pca
+
 def prepare_dataset(args, samples_type='ratio'):
     # prepare data
     if args.dataset in ['Indian', 'Pavia', 'Houston']:
@@ -44,8 +79,16 @@ def prepare_dataset(args, samples_type='ratio'):
     print(f"标签唯一值: {np.unique(label)}")
 
     # train data change to the ratio of train samples
+    #训练样本比例划分
+    """
     if samples_type == 'ratio':
         training_ratio = 1
+        train_idx, TR = split_train_data_clssnum(TR, num_classes, training_ratio)
+    """
+    if samples_type == 'ratio':
+        training_ratio = float(getattr(args, "train_ratio", 1.0))
+        if not (0.0 < training_ratio <= 1.0):
+            raise ValueError(f"train_ratio must be in (0, 1], got {training_ratio}")
         train_idx, TR = split_train_data_clssnum(TR, num_classes, training_ratio)
 
     # normalize data by band norm
@@ -56,27 +99,39 @@ def prepare_dataset(args, samples_type='ratio'):
         input_normalize[:, :, i] = (input[:, :, i] - input_min) / (input_max - input_min)
 
     # === 这里开始：根据模型类型决定是否做 PCA ===
-    if getattr(args, "model_name", None) == 'HybridSN':
+    enable_pca_models = {'HybridSN', 'GraphMamba', 'SSFTT'}
+    if getattr(args, "model_name", None) in enable_pca_models:
         # 1) 在整幅图像上做 PCA（严格按原 HybridSN 流程）
         H, W, C = input_normalize.shape
         X = input_normalize.reshape(-1, C)
 
-        n_components = 15  # 可按论文或需求调整
-        print(f"HybridSN 模型启用 PCA 光谱降维，n_components = {n_components}")
-        pca = PCA(n_components=n_components, whiten=False)
-        X_pca = pca.fit_transform(X)
+        if args.model_name == 'HybridSN':
+            n_components = 15
+            whiten = False
+        elif args.model_name == 'GraphMamba':
+            n_components = 30
+            whiten = True
+        elif args.model_name == 'SSFTT':
+            n_components = 30
+            whiten = False
+        else:
+            raise ValueError(f"Unexpected PCA model_name: {args.model_name}")
+
+        if n_components > C:
+            raise ValueError(f"PCA n_components={n_components} 不能大于原始波段数 C={C}")
+
+        print(f"{args.model_name} 模型启用 PCA 光谱降维，n_components = {n_components}, whiten = {whiten}")
+        X_pca = _pca_fit_or_load_transform(X, args, n_components, whiten)
         input_pca = X_pca.reshape(H, W, n_components)
 
-        # 2) 使用 PCA 后的数据作为后续 patch 提取的输入
         height, width, band = input_pca.shape
         print("PCA 后数据形状: height={0},width={1},band={2}".format(height, width, band))
 
-        # obtain train and test data
         total_pos_train, total_pos_test, total_pos_true, number_train, number_test, number_true = chooose_train_and_test_point(
-            TR, TE, label, num_classes)
-
-        # 用 PCA 后的数据生成镜像图像
+            TR, TE, label, num_classes
+        )
         mirror_image = mirror_hsi(height, width, band, input_pca, patch=args.patches)
+
     else:
         # 其他模型保持原来的预处理，不做 PCA
         height, width, band = input.shape
@@ -109,29 +164,23 @@ def create_universal_dataloaders(x_train_band, x_test_band, x_true_band, y_train
                                  dataset_name):
     """统一的数据加载器创建，兼容所有数据集"""
 
-    # 🎯 修复：处理空训练集的情况（测试阶段）
+    # 训练集：统一走 UniversalDataset，确保数据增强实际生效
     if len(y_train) > 0:
-        # 训练集：总是使用原始Tensor方式（确保性能）
-        if isinstance(x_train_band, np.ndarray):
-            x_train = torch.from_numpy(x_train_band.transpose(0, 3, 1, 2)).float()
-        else:
-            # 如果是文件路径，加载为数组
-            x_train_band_data = np.load(x_train_band, mmap_mode='r')
-            x_train = torch.from_numpy(x_train_band_data.transpose(0, 3, 1, 2)).float()
-
-        y_train_tensor = torch.from_numpy(y_train).long()
-        train_dataset = Data.TensorDataset(x_train, y_train_tensor)
-        label_train_loader = Data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        print(f"✅ 训练集加载完成: {len(train_dataset)} 个样本")
+        train_dataset = UniversalDataset(x_train_band, y_train, dataset_name + '_train')
+        label_train_loader = Data.DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=torch.cuda.is_available(),
+        )
+        print(f"✅ 训练集加载完成(含增强): {len(train_dataset)} 个样本")
     else:
-        # 🎯 修复：创建真正可用的空DataLoader
         print("⚠️ 训练集为空（测试阶段正常情况）")
-        # 创建一个包含单个虚拟样本的数据集，但实际不会使用
-        dummy_data = torch.zeros(1, 48, 7, 7)  # 根据你的数据形状调整
+        dummy_data = torch.zeros(1, 48, 7, 7)
         dummy_labels = torch.zeros(1, dtype=torch.long)
         dummy_dataset = Data.TensorDataset(dummy_data, dummy_labels)
         label_train_loader = Data.DataLoader(dummy_dataset, batch_size=1, shuffle=False)
-        # 注意：这个DataLoader实际上不会被使用，只是为了满足代码结构
 
     # 测试集：根据数据集大小选择策略
     test_samples = len(y_test)

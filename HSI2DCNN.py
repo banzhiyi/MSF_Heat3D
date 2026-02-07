@@ -16,8 +16,8 @@ class HSI2DCNN(nn.Module):
         band: int,
         num_classes: int,
         patch_size: int,
-        base_channels: int = 32,
-        dropout: float = 0.6,
+        base_channels: int = 36,
+        dropout: float = 0.8,
     ):
         super().__init__()
 

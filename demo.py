@@ -13,13 +13,14 @@ import numpy as np
 import time
 import os
 import json
+import warnings
 import pandas as pd
 from datetime import datetime
 import subprocess
 from ViT import ViT
 from HybridSN import HybridSN
 from morphFormer import MorphFormer
-from ssftt import SSFTT
+from SSFTT.ssftt import SSFTT
 from HSI3DCNN import HSI3DCNN
 from DSNet import DSNet
 from MASSFormer import MASSFormer
@@ -30,6 +31,9 @@ from VisionMamba.VMamba import VisionMambaClassifier
 from fvcore.nn import FlopCountAnalysis
 from S2Mamba import S2Mamba
 from vHeat import S2VHeat
+from Mamba_3DSS.model_adapter import Mamba3DSSClassifier
+from SpectralMamba import SpectralMambaPatch
+from GraphMamba.GraphMamba import GraphMambaClassifier
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
@@ -37,15 +41,79 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'MambaHSI', 'VMamba', 'S2Mamba'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', '3DSS_Mamba', 'VMamba', 'S2Mamba', 'SpectralMamba', 'GraphMamba'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
 parser.add_argument('--epoches', type=int, default=500, help='epoch number')
-parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
-parser.add_argument('--gamma', type=float, default=0.9, help='gamma')
-parser.add_argument('--weight_decay', type=float, default=0, help='weight_decay')
+parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate')
+parser.add_argument('--gamma', type=float, default=0.99, help='gamma')
+parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight_decay')
+parser.add_argument('--train_ratio', type=float, default=1.0, help='subsample ratio of predefined training set TR, e.g. 0.2/0.4/0.6/0.8/1.0')
 args = parser.parse_args()
+
+def estimate_macs_robust(model, dummy_input, model_name: str):
+    """
+    返回 MACs/FLOPs（标量，单位：FLOPs），失败返回 None。
+    统计顺序：
+      1) fvcore (FX/trace)  \-\> 可能对 Triton/Mamba 不稳定
+      2) ptflops (hook)     \-\> 通常更稳
+      3) thop (hook)        \-\> 也较稳，但对自定义算子可能漏记
+      4) 兜底：None
+    """
+    model.eval()
+
+    # \[1\] fvcore：对大多数 CNN/Transformer 好用，但 Mamba\+Triton 往往不友好
+    if model_name not in {"VMamba"}:
+        try:
+            from fvcore.nn import FlopCountAnalysis
+            with torch.no_grad():
+                flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
+                flops = float(flops_analyzer.total())
+            return flops
+        except Exception as e:
+            warnings.warn(f"[FLOPs] fvcore failed for {model_name}: {type(e).__name__}: {e}")
+
+    # \[2\] ptflops：forward hook 统计（更少依赖 graph trace）
+    try:
+        # pip install ptflops
+        from ptflops import get_model_complexity_info
+
+        # ptflops 默认输入格式是 (C,H,W) 或 (C,D,H,W)；你的输入是 (B,C,H,W)
+        # 这里传不带 batch 的 shape
+        inp = dummy_input
+        if inp.dim() == 4:
+            input_res = (inp.size(1), inp.size(2), inp.size(3))
+        elif inp.dim() == 5:
+            input_res = (inp.size(1), inp.size(2), inp.size(3), inp.size(4))
+        else:
+            raise ValueError(f"Unsupported dummy_input dim: {inp.dim()}")
+
+        with torch.no_grad():
+            macs_str, params_str = get_model_complexity_info(
+                model,
+                input_res,
+                as_strings=False,
+                print_per_layer_stat=False,
+                verbose=False,
+            )
+        # ptflops 返回的是 MACs（通常按 MACs 口径），这里直接按 FLOPs 近似同量级输出
+        return float(macs_str)
+    except Exception as e:
+        warnings.warn(f"[FLOPs] ptflops failed for {model_name}: {type(e).__name__}: {e}")
+
+    # \[3\] thop：同样是 hook，很多模型可用
+    try:
+        # pip install thop
+        from thop import profile
+        with torch.no_grad():
+            macs, params = profile(model, inputs=(dummy_input,), verbose=False)
+        return float(macs)
+    except Exception as e:
+        warnings.warn(f"[FLOPs] thop failed for {model_name}: {type(e).__name__}: {e}")
+
+    # \[4\] 兜底：返回 None（你可以在外部打印 N/A）
+    return None
 
 def get_git_branch_name():
     """获取当前 Git 分支名"""
@@ -365,6 +433,43 @@ def main():
             if_cls_token=True,
             use_middle_cls_token=True,
         )
+    elif args.model_name == "3DSS_Mamba":
+        model = Mamba3DSSClassifier(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            depth=1,
+            embed_dim=32,
+            d_state=16,
+            group_type="Cube",
+            scan_type="Parallel spectral-spatial",
+            k_group=4,
+            conv3D_channel=32,
+            conv3D_kernel=(3, 5, 5),
+            drop_path_rate=0.1,
+        )
+    elif args.model_name == "SpectralMamba":
+        model = SpectralMambaPatch(
+            bands=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            chunk_size=12,  # \*关键：要求 band % chunk_size == 0
+            depth=6,
+            expansion=4,
+            drop=0.0,
+        )
+    elif args.model_name == "GraphMamba":
+        model = GraphMambaClassifier(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            depth=3,  # 新增参数：Mamba+GCN 堆叠层数
+            embed_dim=64,  # 改名：hidden_dim → embed_dim
+            gcn_layers=2,  # 保持你原来的值（但建议改成3）
+            rms_norm=True,  # 新增：使用RMSNorm
+            residual_in_fp32=True,  # 新增：FP32残差
+            fused_add_norm=True,  # 新增：融合操作
+        )
     elif args.model_name == "S2Mamba":
         model = S2Mamba(
             patch=args.patches,  # patch 尺寸
@@ -373,8 +478,8 @@ def main():
             depths=[1],  # 先用最小配置跑通
             dims=[64],  # hidden dim
             d_state=16,
-            drop_rate=0.0,
-            attn_drop_rate=0.0,
+            drop_rate=0,
+            attn_drop_rate=0.1,
             drop_path_rate=0.1,
         )
     elif args.model_name == 'ViT':
@@ -437,26 +542,37 @@ def main():
         dummy_input = torch.randn(1, band, args.patches, args.patches, device=device)
 
     model.eval()
-    # VMamba 会触发 mamba_ssm 的 Triton layer norm 编译，fvcore trace 阶段可能直接报错
-    if args.model_name == "VMamba":
-        print("Skip MACs/FLOPs for VMamba (Triton kernel is not trace-friendly under fvcore).")
+    macs = estimate_macs_robust(model, dummy_input, args.model_name)
+    if macs is None:
+        print(f"Total MACs: N/A (unsupported ops for {args.model_name})")
     else:
-        try:
-            with torch.no_grad():
-                flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
-                macs = flops_analyzer.total()  # 单位: FLOPs (\~= MACs)
-            macs_g = macs / 1e6
-            print("Total MACs: {:.2f} M".format(macs_g))
-        except Exception as e:
-            print(f"Skip MACs/FLOPs due to analysis error: {type(e).__name__}: {e}")
+        print("Total MACs: {:.2f} M".format(macs / 1e6))
     # criterion
     criterion = nn.CrossEntropyLoss().to(device)
     # Set the optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.learning_rate,  # 建议运行时传 --learning_rate 1e-4 或把默认值改成 1e-4
+        weight_decay=args.weight_decay  # 建议运行时传 --weight_decay 5e-3 或把默认值改成 5e-3
+    )
+
+
+
     # 🆕 修改：只有 s2vnet 需要应用 NonZeroClipper
     if args.model_name == 's2vnet':
         apply_nonegative = NonZeroClipper()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epoches // 10, gamma=args.gamma)
+
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer,
+        gamma=args.gamma  # 建议运行时传 --gamma 0.99 或把默认值改成 0.99
+    )
+
+
+
+
 
     # 🆕 初始化训练日志
     log_path = init_training_log(experiment_dir)
@@ -586,7 +702,7 @@ def main():
     else:
         print("start training")
         tic = time.time()
-        min_val_obj, best_OA = 0.5, 0
+        min_val_obj, best_OA = 0.3, 0
         best_epoch = 0
         best_AA = 0
         best_Kappa = 0

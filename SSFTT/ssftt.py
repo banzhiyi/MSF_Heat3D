@@ -181,13 +181,12 @@ class SSFTTnet(nn.Module):
         B, C, H, W = x_2d.shape
         x_flat = x_2d.flatten(2).transpose(1, 2)       # [B, L, C]
 
-        # 下面维持你原来的 token 选择逻辑
-        # 假设 L >= num_tokens
-        if x_flat.size(1) >= self.num_tokens:
-            tokens = x_flat[:, : self.num_tokens, :]
+        L = x_flat.size(1)
+        if L >= self.num_tokens:
+            idx = torch.linspace(0, L - 1, steps=self.num_tokens, device=x_flat.device).long()
+            tokens = x_flat.index_select(1, idx)
         else:
-            # 不足时 padding
-            pad = self.num_tokens - x_flat.size(1)
+            pad = self.num_tokens - L
             pad_tokens = x_flat[:, -1:, :].repeat(1, pad, 1)
             tokens = torch.cat([x_flat, pad_tokens], dim=1)
 

@@ -3,6 +3,8 @@ import os
 import numpy as np
 import torch
 from sklearn.manifold import TSNE
+import matplotlib
+matplotlib.use("Agg")  # 强制使用无GUI后端，避免Tk工具栏/图标相关错误
 import matplotlib.pyplot as plt
 
 from dataset import prepare_dataset
@@ -17,7 +19,7 @@ def parse_args():
     p.add_argument("--ckpt", type=str, required=True)
     p.add_argument("--samples_per_class", type=int, default=200)
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--out", type=str, default="./tsne_feat.png")
+    p.add_argument("--out", type=str, default="./results/vis_results/tsne_feat.png")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -122,8 +124,8 @@ def main():
         idx = (y == c)
         if not np.any(idx):
             continue
-        plt.scatter(Z[idx, 0], Z[idx, 1], s=8, alpha=0.8, label=str(c))
-    plt.legend(markerscale=2, bbox_to_anchor=(1.02, 1.0), loc="upper left")
+        plt.scatter(Z[idx, 0], Z[idx, 1], s=8, alpha=0.8, label=str(c + 1))
+    plt.legend(markerscale=2, loc="upper right")
     plt.tight_layout()
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)

@@ -16,7 +16,7 @@ from utils.HSICommonUtils import normlize3D, ImageStretching
 from utils.setup_logger import setup_logger
 from utils.visual_predict import visualize_predict
 from PIL import Image
-from model.MambaHSI import MambaHSI
+from MambaHSI import MambaHSI
 
 from calflops import calculate_flops
 

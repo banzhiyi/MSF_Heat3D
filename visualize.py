@@ -1,14 +1,20 @@
 import os
 import argparse
+import joblib
 from typing import Optional
 import numpy as np
 import scipy.io as sio
+import matplotlib
+matplotlib.use("Agg")  # 强制无 GUI 后端，避免 Tk/PIL 导致的 height/width=0 报错
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import torch
 import torch.nn.functional as F
-
-
+from SSFTT.ssftt import SSFTT
+from morphFormer import MorphFormer
+import torch
+import torch.nn as nn
+from sklearn.decomposition import PCA
 from vHeat import S2VHeat
 from vheat3d_model import MSF_Heat3D
 from DSNet import DSNet
@@ -17,7 +23,11 @@ from SiT import SiT
 from HSI2DCNN import HSI2DCNN
 from vHeat import S2VHeat
 from VisionMamba.VMamba import VisionMambaClassifier
-
+from GraphMamba.GraphMamba import GraphMambaClassifier
+from S2Mamba import S2Mamba
+from HSI3DCNN import HSI3DCNN
+from ViT import ViT
+from HybridSN import HybridSN
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 INDIAN_PINES_COLORS = np.array(
@@ -124,6 +134,41 @@ def infer_dataset_key(data_path: str, dataset_hint: Optional[str] = None) -> str
                 return key
     return "indian"
 
+def load_or_fit_pca_hsi(hsi: np.ndarray, n_components: int, pca_path: Optional[str] = None) -> np.ndarray:
+    """
+    优先加载训练时保存的 PCA 并 transform；否则才对当前整幅图 fit（不推荐）。
+    输入: (H, W, B)  输出: (H, W, n_components)
+    """
+    H, W, B = hsi.shape
+    x = hsi.reshape(-1, B).astype(np.float32)
+
+    if pca_path and os.path.isfile(pca_path):
+        pca = joblib.load(pca_path)
+        x = x - x.mean(axis=0, keepdims=True) if getattr(pca, "mean_", None) is None else x
+        x_pca = pca.transform(x).astype(np.float32)
+    else:
+        # fallback: 现 fit（会造成与训练不一致的风险）
+        x = x - x.mean(axis=0, keepdims=True)
+        pca = PCA(n_components=n_components, svd_solver="full", whiten=False)
+        x_pca = pca.fit_transform(x).astype(np.float32)
+
+    if x_pca.shape[1] != n_components:
+        raise RuntimeError(f"PCA components mismatch: got {x_pca.shape[1]} vs n_components={n_components}")
+    return x_pca.reshape(H, W, n_components)
+
+def apply_pca_hsi(hsi: np.ndarray, n_components: int = 30) -> np.ndarray:
+    """
+    对 HSI 做 PCA：\n
+    输入: (H, W, B)\n
+    输出: (H, W, n_components)\n
+    """
+    H, W, B = hsi.shape
+    x = hsi.reshape(-1, B).astype(np.float32)
+    x = x - x.mean(axis=0, keepdims=True)
+    pca = PCA(n_components=n_components, svd_solver="full", whiten=False)
+    x_pca = pca.fit_transform(x).astype(np.float32)
+    return x_pca.reshape(H, W, n_components)
+
 def load_split_mat_dataset(root_dir: str):
     parts = {
         "cube": os.path.join(root_dir, "data_HS_LR.mat"),
@@ -205,8 +250,47 @@ def build_model(
         model = SiT(band, num_classes, patch_size)
     elif model_name == "hsi2dcnn":
         model = HSI2DCNN(band, num_classes, patch_size)
+    elif model_name == "hsi3dcnn":
+        model = HSI3DCNN(band, num_classes, patch_size)
+    elif model_name == 'hybridsn':
+        # 与其他模型相同的接口: (band, num_classes, patches)
+        model = HybridSN(band, num_classes, patch_size)
     elif model_name == "vheat":
         model = S2VHeat(band, num_classes, patch_size)
+    elif model_name == 'vit':
+        # 这里 img_size 使用 HSI patch 的空间尺寸 args.patches
+        # vit_patch_size 可以先设为 1，表示整个 HSI patch 视作一个 "token 网格"
+        model = ViT(
+            band=band,
+            num_classes=num_classes,
+            img_size=patch_size,
+            vit_patch_size=1,   # 若想划分更多 patch，可改为 2, 3 等，需保证能整除 img_size
+            embed_dim=192,
+            depth=6,
+            num_heads=3,
+        )
+    elif model_name == "ssftt":
+        model = SSFTT(
+            band=band,
+            num_classes=num_classes,
+            patch_size=patch_size,
+            num_tokens=4,
+            dim=64,
+            depth=1,
+            heads=8,
+            mlp_dim=128,
+            dropout=0.1,
+            emb_dropout=0.1,
+        )
+    elif model_name == "morphformer":
+        # 关键: 这里不要再 wrapper，确保 state_dict key 能对齐你保存的权重
+        model = MorphFormer(
+            band=band,
+            num_classes=num_classes,
+            patch_size=patch_size,
+            fm=16,
+            hsi_only=False,
+        )
     elif model_name == "vmamba":
         model = VisionMambaClassifier(
             band=band,
@@ -221,6 +305,31 @@ def build_model(
             if_cls_token=True,
             use_middle_cls_token=True,
         )
+    elif model_name == "graphmamba":
+         model = GraphMambaClassifier(
+            band=band,
+            num_classes=num_classes,
+            patch_size=patch_size,
+            depth=3,  # 新增参数：Mamba+GCN 堆叠层数
+            embed_dim=64,  # 改名：hidden_dim → embed_dim
+            gcn_layers=2,  # 保持你原来的值（但建议改成3）
+            rms_norm=True,  # 新增：使用RMSNorm
+            residual_in_fp32=True,  # 新增：FP32残差
+            fused_add_norm=True,  # 新增：融合操作
+        )
+    elif model_name == "s2mamba":
+        model = S2Mamba(
+            patch=patch_size,
+            in_chans=band,
+            num_classes=num_classes,
+            depths=[1],
+            dims=[64],
+            d_state=16,
+            drop_rate=0.0,
+            attn_drop_rate=0.1,
+            drop_path_rate=0.1,
+        )
+
     elif model_name in {"msf_heat3d", "msf-heat3d", "heat3d", "vheat3d"}:
         pca_tensor = None
         if reducer_type == "pca":
@@ -245,6 +354,20 @@ def build_model(
     model.eval()
     model.to(DEVICE)
     return model
+
+def _extract_logits(model_output):
+    # Tensor: 直接返回
+    if torch.is_tensor(model_output):
+        return model_output
+    # tuple/list: 常见为 (logits, feat, ...)
+    if isinstance(model_output, (tuple, list)) and len(model_output) > 0 and torch.is_tensor(model_output[0]):
+        return model_output[0]
+    # dict: 常见键名
+    if isinstance(model_output, dict):
+        for k in ("logits", "pred", "out", "cls_logits"):
+            if k in model_output and torch.is_tensor(model_output[k]):
+                return model_output[k]
+    raise TypeError(f"Unsupported model output type: {type(model_output)}")
 
 def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: int,
                            num_classes: int, band: int, batch_size: int = 512):
@@ -281,7 +404,17 @@ def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: 
         batch = torch.from_numpy(batch_np).to(device)
 
         with torch.no_grad():
-            logits = model(batch)  # (B, num_classes)
+            #logits = model(batch)  # (B, num_classes)
+            out = model(batch)
+            logits = _extract_logits(out)  # (B, ?)
+
+            # 关键兜底: MorphFormer 有时会返回 (B, 64) 等，确保最后一维是 num_classes
+            if logits.dim() != 2:
+                raise RuntimeError(f"Expected logits with shape (B, C), got {tuple(logits.shape)}")
+            if logits.size(1) != num_classes:
+                # 如果是多输出/拼接导致，先裁剪到 num_classes，避免广播错误
+                # 注意: 这只是为了跑通可视化；若仍不正确，需要回到 MorphFormer 的 forward/head 输出定位
+                logits = logits[:, :num_classes]
             probs = F.softmax(logits, dim=1).cpu().numpy()
 
         for (h_idx, w_idx), prob in zip(coords, probs):
@@ -338,10 +471,11 @@ def main():
     parser.add_argument("--data_path", default="./data/IndianPine.mat")
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--dataset_name", default=None)
-    parser.add_argument("--patch_size", type=int, default=9)
+    parser.add_argument("--patch_size", type=int, default=7)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--output_dir", default="./results/vis_results")
     parser.add_argument("--false_color_bands", nargs=3, type=int, default=(30, 20, 10))
+    parser.add_argument("--ssftt_pca_components", type=int, default=30)
     parser.add_argument("--reduced_bands", type=int, default=24)
     parser.add_argument("--heat_hidden_dim", type=int, default=64)
     parser.add_argument("--head_channels", type=int, default=128)
@@ -349,12 +483,19 @@ def main():
     parser.add_argument("--pca_path", default=None)
     parser.add_argument("--freq_pool", choices=["avg", "max", "avgmax"], default="avgmax")
     parser.add_argument("--disable_post_norm", action="store_true")
-    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "MASSFormer", "SiT", "HSI2DCNN", "vHeat", "VMamba"], default="MSF_Heat3D")
+    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "ViT", "MASSFormer", "SiT", "HSI2DCNN", "HSI3DCNN","HybridSN", "vHeat", "VMamba", "SSFTT", "MorphFormer", "GraphMamba", "S2Mamba"], default="MSF_Heat3D")
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)
     dataset_name = (args.dataset_name or dataset_key.capitalize()).replace(".mat", "")
     hsi, TR, TE, gt, num_classes = load_hsi_dataset(args.data_path, dataset_key)
+
+    if (args.model_name or "").lower() in {"hybridsn", "ssftt", "graphmamba"}:
+        hsi = load_or_fit_pca_hsi(
+            hsi,
+            n_components=args.ssftt_pca_components,
+            pca_path=args.pca_path,  # 传入训练时保存的 PCA 路径
+        )
 
     class_colors = select_class_colors(dataset_key)
     model = build_model(
