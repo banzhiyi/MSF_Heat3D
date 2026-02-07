@@ -46,9 +46,9 @@ parser.add_argument('--batch_size', type=int, default=64, help='number of batch 
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
 parser.add_argument('--epoches', type=int, default=500, help='epoch number')
-parser.add_argument('--learning_rate', type=float, default=1e-4, help='learning rate')
-parser.add_argument('--gamma', type=float, default=0.99, help='gamma')
-parser.add_argument('--weight_decay', type=float, default=1e-5, help='weight_decay')
+parser.add_argument('--learning_rate', type=float, default=1e-3, help='learning rate')
+parser.add_argument('--gamma', type=float, default=0.9, help='gamma')
+parser.add_argument('--weight_decay', type=float, default=0, help='weight_decay')
 parser.add_argument('--train_ratio', type=float, default=1.0, help='subsample ratio of predefined training set TR, e.g. 0.2/0.4/0.6/0.8/1.0')
 args = parser.parse_args()
 
@@ -551,12 +551,13 @@ def main():
     criterion = nn.CrossEntropyLoss().to(device)
     # Set the optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-
+    """
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,  # 建议运行时传 --learning_rate 1e-4 或把默认值改成 1e-4
         weight_decay=args.weight_decay  # 建议运行时传 --weight_decay 5e-3 或把默认值改成 5e-3
     )
+    """
 
 
 
@@ -564,12 +565,12 @@ def main():
     if args.model_name == 's2vnet':
         apply_nonegative = NonZeroClipper()
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epoches // 10, gamma=args.gamma)
-
+    """
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer,
         gamma=args.gamma  # 建议运行时传 --gamma 0.99 或把默认值改成 0.99
     )
-
+    """
 
 
 
