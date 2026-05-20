@@ -1,10 +1,10 @@
 import math
-from typing import Optional, Callable
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.layers import DropPath
 
 DropPath.__repr__ = lambda self: f"timm.DropPath({self.drop_prob})"
 
@@ -533,16 +533,21 @@ class ParallelHeat3DLayer(nn.Module):
                  num_branches: int = 3,
                  freq_config: str = "low_mid_high",
                  parallel_cfg: Optional[dict] = None,
+                 use_fbm: bool = True,  # 新增：是否使用 Frequency-Band Mask
+                 use_afbf: bool = True,  # 新增：是否使用 AFBF
                  ):
         """
         freq_config:
           - "all_mid": \["mid", "mid", ...]
           - "mid_high": 例如 2 分支时 \["mid","high"]
           - "low_mid_high": 3 分支时 \["low","mid","high"]
+          - "low_high": 2 分支时 \["low","high"]
         """
         super().__init__()
         self.num_branches = num_branches
         self.freq_config = freq_config  # 保存下来，便于核对
+        self.use_fbm = use_fbm  # 新增：保存开关
+        self.use_afbf = use_afbf
         inner_dim = inner_dim or channels // 2
         # 保存配置（带默认值）
         cfg = parallel_cfg or {}
@@ -585,7 +590,15 @@ class ParallelHeat3DLayer(nn.Module):
 
         # 把 inner_dim 投回 channels
         self.proj = nn.Conv3d(inner_dim, channels, kernel_size=1, bias=True)
-        self.fuse = FreqBranchAttention(channels=inner_dim, num_branches=num_branches, alpha=alpha,)
+        #self.fuse = FreqBranchAttention(channels=inner_dim, num_branches=num_branches, alpha=alpha,)
+        if self.use_afbf:
+            self.fuse = FreqBranchAttention(
+                channels=inner_dim,
+                num_branches=num_branches,
+                alpha=alpha,
+            )
+        else:
+            self.fuse = None
 
     def forward(self, x, freq_embed_parallel=None):
         # x: (B, C, S, H, W)
@@ -638,16 +651,41 @@ class ParallelHeat3DLayer(nn.Module):
         }
 
         # ----- 动态跑 num_branches 个分支 -----
+        """
         feats = []
         for i, mode in enumerate(self.freq_modes):
             freq_mask = mask_map[mode]
             feats.append(self.branches[i](x, freq_embed_parallel, freq_mask=freq_mask))
+        """
+        feats = []
+        for i, mode in enumerate(self.freq_modes):
+            if self.use_fbm:
+                freq_mask = mask_map[mode]
+            else:
+                freq_mask = None
+
+            feats.append(
+                self.branches[i](
+                    x,
+                    freq_embed_parallel,
+                    freq_mask=freq_mask
+                )
+            )
 
         # 频率自适应融合，仍然是 \[B, inner_dim, S, H, W]
-        out = self.fuse(feats)  # [B, inner_dim, S, H, W]
+        #out = self.fuse(feats)  # [B, inner_dim, S, H, W]
 
         # 使用 1x1x1 Conv3d 把 inner_dim 投回 channels，保持与输入一致
-        out = self.proj(out)  # 形状变为 \[B, channels, S, H, W]
+        #out = self.proj(out)  # 形状变为 \[B, channels, S, H, W]
+        if self.use_afbf:
+            # AFBF: input-dependent adaptive fusion
+            out = self.fuse(feats)  # [B, inner_dim, S, H, W]
+        else:
+            # w/o AFBF: fixed average fusion
+            out = torch.stack(feats, dim=0).mean(dim=0)  # [B, inner_dim, S, H, W]
+
+        # 使用 1x1x1 Conv3d 把 inner_dim 投回 channels，保持与输入一致
+        out = self.proj(out)
 
         return out
 
@@ -672,6 +710,8 @@ class MSF_Heat3D(nn.Module):
                  use_post_norm: bool = True,
                  use_multiscale: bool = True,
                  dataset_name: str = "indian",
+                 use_fbm: bool = True,  # 新增
+                 use_afbf: bool = True,  # 新增
                  ):
         super().__init__()
         self.band = band
@@ -756,6 +796,8 @@ class MSF_Heat3D(nn.Module):
             num_branches=3,
             freq_config="low_mid_high", # “low" "mid" "high"
             parallel_cfg=self.parallel_cfg,  #关键：把数据集专属配置传进去
+            use_fbm=use_fbm,  # 新增
+            use_afbf=use_afbf,
         )
         self.second_norm = LayerNorm3d(heat_hidden_dim) if use_post_norm else nn.Identity()
 
@@ -836,7 +878,16 @@ class MSF_Heat3D(nn.Module):
             return torch.cat([avg, mx], dim=1)
         raise ValueError(f"未知 freq_pool: {self.freq_pool}")
 
-    def forward(self, x: torch.Tensor, return_feat: bool = False) -> torch.Tensor:
+    @staticmethod
+    def _parse_feat_stage(feat_stage: str):
+        valid = {"initial", "logits_pre", "both"}
+        if feat_stage not in valid:
+            raise ValueError(f"未知 feat_stage: {feat_stage}, 可选值: {sorted(valid)}")
+        return feat_stage
+
+    def forward(self, x: torch.Tensor, return_feat: bool = False,
+                feat_stage: str = "logits_pre"):
+        feat_stage = self._parse_feat_stage(feat_stage)
         # 形状统一到 (B, H, W, S) 以匹配 reducer
         x_cl = self._to_channels_last_hw_s(x, self.band)
         B, H, W, S = x_cl.shape
@@ -866,6 +917,9 @@ class MSF_Heat3D(nn.Module):
         else:                           # (B, H, W, S')
             x3d = x_red.permute(0, 3, 1, 2).unsqueeze(1).contiguous()
 
+        # 最初向量特征：仅经过 reducer 的原始光谱表征，作为 t-SNE 对比基线
+        init_feat_vec = x3d.squeeze(1).mean(dim=(2, 3)).contiguous()  # (B, reduced_bands)
+
         # 2) 第一层 Heat3D
         if self.use_checkpoint:
             x3d = torch.utils.checkpoint.checkpoint(self.heat_first, x3d, None)
@@ -887,9 +941,7 @@ class MSF_Heat3D(nn.Module):
         # 频率融合 -> 2D Head
         x3d = self.spectral_fusion(x3d)  # (B, head_channels, S, H, W)
         x2d = self._spectral_pool(x3d)   # (B, C2d, H, W)，内部会做 freq_fuse
-        #logits = self.head(x2d)          # (B, num_classes)
-        #return logits
-        # 复用 head 的前半段提取 logits 前向量特征,为了t-SNE可视化
+        # 复用 head 的前半段提取 logits 前向量特征, 为 t-SNE 可视化
         # head: Conv2d -> BN -> GELU -> AdaptiveAvgPool2d(1) -> Flatten -> Linear
         feat = x2d
         feat = self.head[0](feat)
@@ -900,6 +952,13 @@ class MSF_Heat3D(nn.Module):
 
         logits = self.head[5](feat_vec)  # Linear
 
-        if return_feat:
+        if not return_feat:
+            return logits
+        if feat_stage == "initial":
+            return logits, init_feat_vec
+        if feat_stage == "logits_pre":
             return logits, feat_vec
-        return logits
+        return logits, {
+            "initial": init_feat_vec,
+            "logits_pre": feat_vec,
+        }

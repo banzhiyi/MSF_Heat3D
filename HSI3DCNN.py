@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+
+
 class ResidualBlock3D(nn.Module):
     def __init__(self, channels: int, bottleneck_ratio: int = 2):
         super(ResidualBlock3D, self).__init__()
@@ -35,19 +36,13 @@ class ResidualBlock3D(nn.Module):
         out = self.act(out)
         return out
 
-class SEBlock3D(nn.Module):
-    def __init__(self, channels: int, reduction: int = 8):
-        super(SEBlock3D, self).__init__()
-        hidden = max(channels // reduction, 4)
-        self.pool = nn.AdaptiveAvgPool3d(1)
-        self.fc1 = nn.Conv3d(channels, hidden, kernel_size=1, bias=True)
-        self.fc2 = nn.Conv3d(hidden, channels, kernel_size=1, bias=True)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.pool(x)
-        w = F.silu(self.fc1(w), inplace=True)
-        w = torch.sigmoid(self.fc2(w))
-        return x * w
+def make_res_stack(channels: int, depth: int, bottleneck_ratio: int = 2) -> nn.Sequential:
+    return nn.Sequential(*[
+        ResidualBlock3D(channels, bottleneck_ratio=bottleneck_ratio)
+        for _ in range(depth)
+    ])
+
 
 class SEBlock3D(nn.Module):
     def __init__(self, channels: int, reduction: int = 8):
@@ -63,14 +58,22 @@ class SEBlock3D(nn.Module):
         w = torch.sigmoid(self.fc2(w))
         return x * w
 
+
 class HSI3DCNN(nn.Module):
     """
-    最终版 3D-CNN HSI 分类模型
+    计算增强版 3D-CNN HSI 分类模型
     输入:  x [B, band, H, W]
     输出:  logits [B, num_classes]
     """
 
-    def __init__(self, band: int, num_classes: int, patch_size: int):
+    def __init__(
+        self,
+        band: int,
+        num_classes: int,
+        patch_size: int,
+        res2_depth: int = 3,
+        res3_depth: int = 3,
+    ):
         super(HSI3DCNN, self).__init__()
         self.band = band
         self.num_classes = num_classes
@@ -102,11 +105,8 @@ class HSI3DCNN(nn.Module):
         self.se2 = SEBlock3D(64)
         self.pool2 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
-        # Stage2 残差块 \*2
-        self.res_block2 = nn.Sequential(
-            ResidualBlock3D(64, bottleneck_ratio=2),
-            ResidualBlock3D(64, bottleneck_ratio=2)
-        )
+        # Stage2 残差块放在 pool2 前，保留 3x3 空间网格以提高 3D 卷积计算量。
+        self.res_block2 = make_res_stack(64, depth=res2_depth, bottleneck_ratio=2)
 
         # ----- Stage 3: 64 -> 128 -----
         self.conv3 = nn.Conv3d(
@@ -121,16 +121,13 @@ class HSI3DCNN(nn.Module):
         self.se3 = SEBlock3D(128)
         self.pool3 = nn.MaxPool3d(kernel_size=(1, 2, 2), stride=(1, 2, 2))
 
-        # Stage3 残差块 \*2
-        self.res_block3 = nn.Sequential(
-            ResidualBlock3D(128, bottleneck_ratio=2),
-            ResidualBlock3D(128, bottleneck_ratio=2)
-        )
+        # Stage3 增加一层残差块，进一步体现 3D-CNN 在光谱维上的计算开销。
+        self.res_block3 = make_res_stack(128, depth=res3_depth, bottleneck_ratio=2)
 
         # ----- Global pooling & classifier -----
         self.global_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
-        # 先对 128\-d 特征做 LayerNorm（更稳定）
+        # 先对 128-d 特征做 LayerNorm（更稳定）
         self.feature_norm = nn.LayerNorm(128)
 
         self.fc1 = nn.Linear(128, 256, bias=False)
@@ -161,10 +158,8 @@ class HSI3DCNN(nn.Module):
         x = self.bn2(x)
         x = F.silu(x, inplace=True)
         x = self.se2(x)
-        x = self.pool2(x)
-
-        # 残差块 2（64 通道, 两层）
         x = self.res_block2(x)
+        x = self.pool2(x)
 
         # ----- Stage 3 -----
         x = self.conv3(x)
@@ -176,7 +171,6 @@ class HSI3DCNN(nn.Module):
         if x.size(-1) >= 2 and x.size(-2) >= 2:
             x = self.pool3(x)
 
-        # 残差块 3（128 通道, 两层）
         x = self.res_block3(x)
 
         # ----- Global pooling & classifier -----
@@ -193,5 +187,3 @@ class HSI3DCNN(nn.Module):
         logits = self.classifier(x)   # [B, num_classes]
 
         return logits
-
-

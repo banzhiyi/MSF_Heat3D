@@ -28,6 +28,7 @@ from S2Mamba import S2Mamba
 from HSI3DCNN import HSI3DCNN
 from ViT import ViT
 from HybridSN import HybridSN
+from ffdb_model import FFDBNet
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 INDIAN_PINES_COLORS = np.array(
@@ -219,6 +220,14 @@ def select_class_colors(dataset_key: str):
     # 默认 indian
     return INDIAN_PINES_COLORS
 
+
+def load_state_dict_safely(ckpt_path: str):
+    try:
+        return torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+    except TypeError:
+        return torch.load(ckpt_path, map_location=DEVICE)
+
+
 def build_model(
     band: int,
     num_classes: int,
@@ -266,7 +275,7 @@ def build_model(
             img_size=patch_size,
             vit_patch_size=1,   # 若想划分更多 patch，可改为 2, 3 等，需保证能整除 img_size
             embed_dim=192,
-            depth=6,
+            depth=7,
             num_heads=3,
         )
     elif model_name == "ssftt":
@@ -326,8 +335,14 @@ def build_model(
             dims=[64],
             d_state=16,
             drop_rate=0.0,
-            attn_drop_rate=0.1,
-            drop_path_rate=0.1,
+            attn_drop_rate=0.1,#0.4
+            drop_path_rate=0.1,#0.4
+        )
+    elif model_name == "ffdbnet":
+        model = FFDBNet(
+            band=band,
+            num_classes=num_classes,
+            patch_size=patch_size,
         )
 
     elif model_name in {"msf_heat3d", "msf-heat3d", "heat3d", "vheat3d"}:
@@ -346,7 +361,7 @@ def build_model(
         raise KeyError(f"unknown model_name: {model_name}")
 
     if os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=DEVICE)
+        state = load_state_dict_safely(ckpt_path)
         model.load_state_dict(state, strict=True)
     else:
         raise FileNotFoundError(f"ckpt not found: {ckpt_path}")
@@ -368,6 +383,7 @@ def _extract_logits(model_output):
             if k in model_output and torch.is_tensor(model_output[k]):
                 return model_output[k]
     raise TypeError(f"Unsupported model output type: {type(model_output)}")
+
 
 def sliding_window_predict(hsi: np.ndarray, model: torch.nn.Module, patch_size: int,
                            num_classes: int, band: int, batch_size: int = 512):
@@ -459,7 +475,7 @@ def save_pred_only(pred: np.ndarray, dataset_name: str, save_dir: str, num_class
     plt.imshow(pred, cmap=cmap, norm=norm)
     plt.axis("off")
     # plt.title(f"{title_prefix} Heat3D_Pipeline Prediction")  # \u5220\u9664\u6216\u6ce8\u91ca\uff0c\u53bb\u6389\u6807\u9898
-    plt.savefig(os.path.join(save_dir, f"{safe_name}_pred.png"), dpi=300, bbox_inches="tight")
+    plt.savefig(os.path.join(save_dir, f"{safe_name}_pred.png"), dpi=300, bbox_inches="tight", pad_inches=0)
     plt.close()
     print(f"saved pred figure to {save_dir}")
 
@@ -483,7 +499,7 @@ def main():
     parser.add_argument("--pca_path", default=None)
     parser.add_argument("--freq_pool", choices=["avg", "max", "avgmax"], default="avgmax")
     parser.add_argument("--disable_post_norm", action="store_true")
-    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "ViT", "MASSFormer", "SiT", "HSI2DCNN", "HSI3DCNN","HybridSN", "vHeat", "VMamba", "SSFTT", "MorphFormer", "GraphMamba", "S2Mamba"], default="MSF_Heat3D")
+    parser.add_argument("--model_name", choices=["MSF_Heat3D", "DSNet", "ViT", "MASSFormer", "SiT", "HSI2DCNN", "HSI3DCNN","HybridSN", "vHeat", "VMamba", "SSFTT", "MorphFormer", "GraphMamba", "S2Mamba", "FFDBNet"], default="MSF_Heat3D")
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)

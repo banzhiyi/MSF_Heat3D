@@ -5,10 +5,13 @@ import math
 
 try:
     from mamba_ssm.modules.mamba_simple import Mamba
+except ImportError:
+    print("Warning: mamba_ssm Mamba is not installed. Using Linear fallback for GraphMamba.")
+    Mamba = None
+
+try:
     from mamba_ssm.ops.triton.layernorm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
-    print("Warning: mamba_ssm not installed. Using dummy Mamba.")
-    Mamba = None
     RMSNorm = nn.LayerNorm
     layer_norm_fn = None
     rms_norm_fn = None

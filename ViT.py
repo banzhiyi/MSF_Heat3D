@@ -7,22 +7,52 @@ import torch.nn.functional as F
 
 class PatchEmbed(nn.Module):
     """
-    将输入图像 [B, C, H, W] 划分为 patch 并映射到 D 维:
-    输出: [B, N, D], 其中 N = (H / patch_size) * (W / patch_size)
+    将 HSI patch [B, C, H, W] 划分为 token 并映射到 D 维。
+
+    当 spectral_group_size 为 None 时，行为等价于普通 2D ViT：
+    每个空间 patch 使用全部光谱通道，N = (H / patch_size) * (W / patch_size)。
+
+    当 spectral_group_size 为正整数时，先把光谱维 C 划分为若干组，再对每组做
+    空间 patch embedding，N = spectral_groups * (H / patch_size) * (W / patch_size)。
+    这让 Transformer 同时建模空间 token 与光谱组 token，避免 HSI 的全部光谱信息
+    只在一个 1x1 Conv 中被线性压缩。
     """
-    def __init__(self, img_size: int, patch_size: int, in_chans: int, embed_dim: int):
+    def __init__(
+        self,
+        img_size: int,
+        patch_size: int,
+        in_chans: int,
+        embed_dim: int,
+        spectral_group_size: Optional[int] = 50,
+    ):
         super().__init__()
         img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
         patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
 
         self.img_size = img_size
         self.patch_size = patch_size
+        self.in_chans = in_chans
+        self.spectral_group_size = spectral_group_size
         self.grid_size = (img_size[0] // patch_size[0], img_size[1] // patch_size[1])
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
 
-        # 使用 Conv2d 完成 patch 划分 + 线性映射
+        if img_size[0] % patch_size[0] != 0 or img_size[1] % patch_size[1] != 0:
+            raise ValueError(f"img_size={img_size} must be divisible by patch_size={patch_size}")
+
+        if spectral_group_size is not None and spectral_group_size <= 0:
+            raise ValueError(f"spectral_group_size must be a positive int or None, got {spectral_group_size}")
+
+        if spectral_group_size is None:
+            self.spectral_groups = 1
+            proj_in_chans = in_chans
+        else:
+            self.spectral_groups = math.ceil(in_chans / spectral_group_size)
+            proj_in_chans = spectral_group_size
+
+        self.num_spatial_patches = self.grid_size[0] * self.grid_size[1]
+        self.num_patches = self.spectral_groups * self.num_spatial_patches
+
         self.proj = nn.Conv2d(
-            in_chans, embed_dim,
+            proj_in_chans, embed_dim,
             kernel_size=patch_size,
             stride=patch_size
         )
@@ -30,9 +60,22 @@ class PatchEmbed(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, H, W]
         B, C, H, W = x.shape
+        if C != self.in_chans:
+            raise ValueError(f"Expected {self.in_chans} input channels, got {C}")
         if H != self.img_size[0] or W != self.img_size[1]:
-            # 简单 resize 到指定大小（保证 H,W 可被 patch_size 整除）
             x = F.interpolate(x, size=self.img_size, mode="bilinear", align_corners=False)
+
+        if self.spectral_group_size is not None:
+            pad_chans = self.spectral_groups * self.spectral_group_size - C
+            if pad_chans > 0:
+                x = F.pad(x, (0, 0, 0, 0, 0, pad_chans))
+            x = x.reshape(B, self.spectral_groups, self.spectral_group_size, *self.img_size)
+            x = x.reshape(B * self.spectral_groups, self.spectral_group_size, *self.img_size)
+            x = self.proj(x)  # [B * G, D, H', W']
+            x = x.flatten(2).transpose(1, 2)  # [B * G, N_spatial, D]
+            x = x.reshape(B, self.spectral_groups * self.num_spatial_patches, -1)
+            return x
+
         x = self.proj(x)  # [B, D, H', W']
         x = x.flatten(2).transpose(1, 2)  # [B, N, D]
         return x
@@ -98,7 +141,8 @@ class ViT(nn.Module):
     - 输入:  [B, band, H, W]
     - 输出:  [B, num_classes]
     - 接口:  ViT(band, num_classes, img_size, vit_patch_size=4, ...)
-    其中 img_size 建议传入 args.patches (例如 7, 9 等 HSI patch 大小)
+    其中 img_size 建议传入 args.patches (例如 7, 9 等 HSI patch 大小)。
+    默认会将光谱维按 spectral_group_size 分组，以提高 HSI ViT 的 token 数。
     """
     def __init__(
         self,
@@ -113,6 +157,7 @@ class ViT(nn.Module):
         qkv_bias: bool = True,
         drop_rate: float = 0.0,
         attn_drop_rate: float = 0.0,
+        spectral_group_size: Optional[int] = 50,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -125,6 +170,7 @@ class ViT(nn.Module):
             patch_size=vit_patch_size,
             in_chans=band,
             embed_dim=embed_dim,
+            spectral_group_size=spectral_group_size,
         )
         num_patches = self.patch_embed.num_patches
 
@@ -189,5 +235,4 @@ class ViT(nn.Module):
         cls_feat = x[:, 0]  # [B, D]
         logits = self.head(cls_feat)  # [B, num_classes]
         return logits
-
 

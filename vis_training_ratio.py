@@ -1,13 +1,17 @@
 import os
+from typing import Dict, List
 
 import matplotlib
-matplotlib.use("Agg")  # 无 GUI 后端：只保存图片
+matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 
 
-# 1) 把不同数据集的数据集中到这里:
-#    结构: dataset_name -> method_name -> list[OA at 20,40,60,80,100]
+# ============================================================
+# 1. Data
+# ============================================================
+
 ALL_DATA = {
     "Indian": {
         "2D-CNN": [42.09, 50.33, 67.31, 78.54, 83.69],
@@ -16,11 +20,11 @@ ALL_DATA = {
         "ViT": [48.11, 64.24, 75.87, 81.22, 86.48],
         "MorphFormer": [57.14, 82.91, 90.09, 90.84, 97.40],
         "SSFTT": [68.23, 80.67, 86.27, 89.27, 93.71],
-        "VMamba": [55.77, 71.61, 80.05, 82.09, 86.32],
+        "ViM": [55.77, 71.61, 80.05, 82.09, 86.32],
         "GraphMamba": [61.36, 78.07, 87.21, 91.30, 96.58],
-        "S2Mamba": [52.73, 75.50, 86.62, 89.28, 95.04],
-        "vHeat": [62.87, 80.13, 87.35, 88.35, 95.55],
-        "MSFHeat3D": [65.94, 83.17, 90.45, 92.12, 97.56],
+        r"S$^2$Mamba": [52.73, 75.50, 86.62, 89.28, 95.04],
+        "HCI-Net": [62.87, 80.13, 87.35, 88.35, 95.55],
+        "MF3DHeat": [65.94, 83.17, 90.45, 92.12, 97.56],
     },
     "Augsburg": {
         "2D-CNN": [73.11, 77.64, 79.81, 83.12, 84.44],
@@ -29,11 +33,11 @@ ALL_DATA = {
         "ViT": [77.53, 78.71, 78.64, 82.65, 86.12],
         "MorphFormer": [83.29, 86.01, 87.18, 89.71, 90.24],
         "SSFTT": [84.38, 87.66, 89.21, 90.72, 91.53],
-        "VMamba": [83.50, 84.43, 84.80, 87.58, 87.78],
+        "ViM": [83.50, 84.43, 84.80, 87.58, 87.78],
         "GraphMamba": [84.49, 86.22, 88.63, 90.83, 91.08],
-        "S2Mamba": [83.32, 87.47, 88.11, 90.79, 91.23],
-        "vHeat": [84.14, 87.24, 87.82, 88.70, 90.38],
-        "MSFHeat3D": [84.53, 87.79, 89.33, 90.88, 91.77],
+        r"S$^2$Mamba": [83.32, 87.47, 88.11, 90.79, 91.23],
+        "HCI-Net": [84.14, 87.24, 87.82, 88.70, 90.38],
+        "MF3DHeat": [84.53, 87.79, 89.33, 90.88, 91.77],
     },
     "Houston": {
         "2D-CNN": [68.18, 80.41, 84.60, 87.58, 88.78],
@@ -42,15 +46,15 @@ ALL_DATA = {
         "ViT": [67.79, 79.89, 83.38, 87.15, 88.80],
         "MorphFormer": [74.72, 81.94, 88.81, 90.86, 93.29],
         "SSFTT": [62.37, 79.41, 84.59, 88.18, 90.39],
-        "VMamba": [72.61, 81.82, 83.76, 86.15, 88.93],
-        "GraphMamba": [58.69, 82.80, 84.67, 90.36, 90.64],
-        "S2Mamba": [75.11, 82.97, 88.44, 91.43, 93.87],
-        "vHeat": [70.78, 82.74, 88.82, 90.93, 92.70],
-        "MSFHeat3D": [76.15, 84.80, 88.97, 91.69, 95.30],
+        "ViM": [72.61, 81.82, 83.76, 86.15, 88.93],
+        "GraphMamba": [58.69, 82.80, 84.67, 86.87, 90.36],
+        r"S$^2$Mamba": [75.11, 82.97, 88.44, 91.43, 93.87],
+        "HCI-Net": [70.78, 82.74, 88.82, 90.93, 92.70],
+        "MF3DHeat": [76.15, 84.80, 88.97, 91.69, 95.30],
     },
 }
 
-# 2) 保证 11 种方法顺序固定（也保证 marker 对应固定）
+
 METHODS = [
     "2D-CNN",
     "3D-CNN",
@@ -58,98 +62,361 @@ METHODS = [
     "ViT",
     "MorphFormer",
     "SSFTT",
-    "VMamba",
+    "ViM",
     "GraphMamba",
-    "S2Mamba",
-    "vHeat",
-    "MSFHeat3D",
+    r"S$^2$Mamba",
+    "HCI-Net",
+    "MF3DHeat",
 ]
 
-# 所有方法用实线，用不同 marker 区分
-MARKERS = ["o", "s", "D", "^", "v", ">", "<", "p", "h", "X", "*"]
-# 不同数据集的 y 轴范围配置
+TRAINING_RATIOS = [20, 40, 60, 80, 100]
+
+
+# ============================================================
+# 2. Figure configuration
+# ============================================================
+
+DATASET_ORDER = ["Indian", "Augsburg", "Houston"]
+
+PANEL_LABELS = {
+    "Indian": "(a)",
+    "Augsburg": "(b)",
+    "Houston": "(c)",
+}
+
 Y_AXIS_CFG = {
     "Indian": (40, 100),
     "Augsburg": (60, 95),
     "Houston": (55, 100),
 }
 
+Y_TICKS = {
+    "Indian": [40, 50, 60, 70, 80, 90, 100],
+    "Augsburg": [60, 70, 80, 90, 95],
+    "Houston": [55, 65, 75, 85, 95, 100],
+}
 
-def plot_dataset(dataset_name: str, data: dict, out_dir: str) -> str:
-    x = [20, 40, 60, 80, 100]
+MAIN_METHOD = "MF3DHeat"
 
-    plt.figure(figsize=(11, 6.5), dpi=150)
+STRONG_BASELINES = [
+    "MorphFormer",
+    "SSFTT",
+    "GraphMamba",
+    r"S$^2$Mamba",
+    "HCI-Net",
+]
 
-    for method, mk in zip(METHODS, MARKERS):
-        if method not in data:
-            raise KeyError(f"{dataset_name} 缺少方法数据: {method}")
+WEAK_BASELINES = [
+    "2D-CNN",
+    "3D-CNN",
+    "HybridSN",
+    "ViT",
+    "ViM",
+]
 
-        y = data[method]
-        if len(y) != len(x):
-            raise ValueError(f"{dataset_name}/{method} 的数据长度应为 {len(x)}，但得到 {len(y)}")
+MARKERS = {
+    "2D-CNN": "o",
+    "3D-CNN": "s",
+    "HybridSN": "D",
+    "ViT": "^",
+    "MorphFormer": "v",
+    "SSFTT": ">",
+    "ViM": "<",
+    "GraphMamba": "p",
+    r"S$^2$Mamba": "h",
+    "HCI-Net": "X",
+    "MF3DHeat": "*",
+}
 
-        kwargs = dict(
-            linestyle="-",  # 统一实线
-            marker=mk,
-            linewidth=2.0,
-            markersize=6,
-            label=method,
+STRONG_COLORS = {
+    "MorphFormer": "#7B61FF",
+    "SSFTT": "#8C564B",
+    "GraphMamba": "#7F7F7F",
+    r"S$^2$Mamba": "#BCBD22",
+    "HCI-Net": "#17BECF",
+}
+
+WEAK_COLORS = {
+    "2D-CNN": "#9E9E9E",
+    "3D-CNN": "#B0B0B0",
+    "HybridSN": "#8FA6B2",
+    "ViT": "#A8A8A8",
+    "ViM": "#B8A9C9",
+}
+
+MFH_COLOR = "#B00020"
+GRID_COLOR = "#9A9A9A"
+
+OUT_DIR = os.path.join(".", "results", "vis_results")
+OUT_NAME = "OA_training_ratio_tripanel_v2"
+EXPORT_FORMATS: List[str] = ["png", "pdf"]
+PNG_DPI = 600
+
+
+# ============================================================
+# 3. Style utilities
+# ============================================================
+
+def choose_available_font() -> str:
+    """
+    避免 Times New Roman 不存在时出现：
+    findfont: Font family 'Times New Roman' not found.
+
+    如果系统中存在 Times New Roman，则使用它；
+    否则使用 matplotlib 默认自带的 DejaVu Serif。
+    """
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+
+    if "Times New Roman" in available_fonts:
+        return "Times New Roman"
+
+    if "Times" in available_fonts:
+        return "Times"
+
+    return "DejaVu Serif"
+
+
+def set_global_style() -> None:
+    font_name = choose_available_font()
+
+    plt.rcParams["font.family"] = font_name
+    plt.rcParams["font.size"] = 11
+    plt.rcParams["axes.linewidth"] = 0.8
+    plt.rcParams["pdf.fonttype"] = 42
+    plt.rcParams["ps.fonttype"] = 42
+    plt.rcParams["savefig.facecolor"] = "white"
+    plt.rcParams["figure.facecolor"] = "white"
+
+    print(f"Using font: {font_name}")
+
+
+def get_method_style(method: str) -> Dict:
+    if method == MAIN_METHOD:
+        return dict(
+            color=MFH_COLOR,
+            linestyle="-",
+            marker=MARKERS[method],
+            linewidth=2.8,
+            markersize=9.5,
+            markeredgewidth=0.7,
+            markeredgecolor="#650010",
+            alpha=1.0,
+            zorder=10,
         )
-        if method == "MSFHeat3D":
-            kwargs["color"] = "darkred"  # 深红色
 
-        plt.plot(x, y, **kwargs)
+    if method in STRONG_BASELINES:
+        return dict(
+            color=STRONG_COLORS[method],
+            linestyle="-",
+            marker=MARKERS[method],
+            linewidth=1.5,
+            markersize=5.2,
+            markeredgewidth=0.4,
+            alpha=0.92,
+            zorder=5,
+        )
 
-    plt.xlabel("Training ratio (%)", fontsize=16)
-    plt.ylabel("Overall Accuracy (%)", fontsize=16)
-    plt.xticks(x, x)
-    # y 轴：按数据集设置范围（并生成对应刻度）
-    y_min, y_max = Y_AXIS_CFG.get(dataset_name, (30, 100))
-    plt.ylim(y_min, y_max)
+    if method in WEAK_BASELINES:
+        return dict(
+            color=WEAK_COLORS[method],
+            linestyle="-",
+            marker=MARKERS[method],
+            linewidth=1.0,
+            markersize=4.6,
+            markeredgewidth=0.3,
+            alpha=0.55,
+            zorder=2,
+        )
 
-    # 生成 10 为步长的刻度；若上限不是 10 的倍数（如 95）也会包含进去
-    ticks = list(range(int((y_min + 9) // 10 * 10), int(y_max // 10 * 10) + 1, 10))
-    if y_min % 10 == 0:
-        ticks = [y_min] + ticks
-    if ticks and ticks[-1] != y_max:
-        ticks.append(y_max)
-    elif not ticks:
-        ticks = [y_min, y_max]
-    plt.yticks(ticks)
-
-    plt.grid(True, which="both", linestyle="--", linewidth=0.8, alpha=0.6)
-
-    plt.legend(
-        loc="lower right",
-        frameon=True,
-        fontsize=14,
-        ncol=1,
-        borderpad=0.6,
-        handlelength=2.6,
+    return dict(
+        color="#999999",
+        linestyle="-",
+        marker="o",
+        linewidth=1.0,
+        markersize=4.5,
+        alpha=0.55,
+        zorder=1,
     )
 
-    plt.tight_layout()
 
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{dataset_name}_OA_training_ratio.png")
-    plt.savefig(out_path, bbox_inches="tight")
-    plt.close()
+# ============================================================
+# 4. Plot function
+# ============================================================
 
-    return out_path
+def plot_tripanel_oa() -> List[str]:
+    set_global_style()
 
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(18.0, 5.4),
+        dpi=300,
+        facecolor="white",
+    )
+
+    for ax, dataset_name in zip(axes, DATASET_ORDER):
+        data = ALL_DATA[dataset_name]
+
+        ax.set_facecolor("white")
+        ax.set_axisbelow(True)
+
+        line_handles = []
+
+        for method in METHODS:
+            if method not in data:
+                raise KeyError(f"{dataset_name} 缺少方法数据: {method}")
+
+            y = data[method]
+
+            if len(y) != len(TRAINING_RATIOS):
+                raise ValueError(
+                    f"{dataset_name}/{method} 的数据长度应为 {len(TRAINING_RATIOS)}，"
+                    f"但得到 {len(y)}"
+                )
+
+            style = get_method_style(method)
+
+            line, = ax.plot(
+                TRAINING_RATIOS,
+                y,
+                label=method,
+                **style,
+            )
+
+            line_handles.append(line)
+
+        # ----------------------------------------------------
+        # Axis limits and ticks
+        # ----------------------------------------------------
+        y_min, y_max = Y_AXIS_CFG[dataset_name]
+        ax.set_ylim(y_min, y_max)
+        ax.set_yticks(Y_TICKS[dataset_name])
+
+        ax.set_xlim(18, 102)
+        ax.set_xticks(TRAINING_RATIOS)
+
+        # ----------------------------------------------------
+        # Each subplot has its own x/y labels
+        # ----------------------------------------------------
+        ax.set_xlabel(
+            "Training ratio (%)",
+            fontsize=18,
+            labelpad=7,
+        )
+
+        ax.set_ylabel(
+            "Overall Accuracy (%)",
+            fontsize=18,
+            labelpad=7,
+        )
+
+        # ----------------------------------------------------
+        # Panel label under each subplot: (a), (b), (c)
+        # ----------------------------------------------------
+        ax.text(
+            0.5,
+            -0.22,
+            PANEL_LABELS[dataset_name],
+            transform=ax.transAxes,
+            ha="center",
+            va="top",
+            fontsize=18,
+            fontweight="normal",
+        )
+
+        # ----------------------------------------------------
+        # Weak grid: only y-axis
+        # ----------------------------------------------------
+        ax.grid(
+            True,
+            axis="y",
+            linestyle="--",
+            linewidth=0.6,
+            alpha=0.35,
+            color=GRID_COLOR,
+        )
+        ax.grid(False, axis="x")
+
+        # ----------------------------------------------------
+        # Clean spines
+        # ----------------------------------------------------
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_linewidth(0.8)
+        ax.spines["bottom"].set_linewidth(0.8)
+
+        ax.tick_params(
+            axis="both",
+            which="major",
+            labelsize=13.5,
+            length=4.0,
+            width=0.9,
+            direction="out",
+        )
+
+        # ----------------------------------------------------
+        # Legend inside each subplot
+        # ----------------------------------------------------
+        ax.legend(
+            handles=line_handles,
+            labels=METHODS,
+            loc="lower right",
+            ncol=2,
+            frameon=True,
+            facecolor="white",
+            edgecolor="#CFCFCF",
+            framealpha=0.78,
+            fontsize=9.0,
+            handlelength=2.0,
+            handletextpad=0.45,
+            columnspacing=0.80,
+            labelspacing=0.35,
+            borderpad=0.45,
+            markerscale=1.00,
+        )
+
+    # --------------------------------------------------------
+    # Layout
+    # --------------------------------------------------------
+    fig.subplots_adjust(
+        left=0.055,
+        right=0.995,
+        top=0.965,
+        bottom=0.255,
+        wspace=0.28,
+    )
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    saved_paths = []
+
+    for ext in EXPORT_FORMATS:
+        out_path = os.path.join(OUT_DIR, f"{OUT_NAME}.{ext}")
+
+        save_kwargs = dict(
+            bbox_inches="tight",
+            facecolor="white",
+        )
+
+        if ext == "png":
+            save_kwargs["dpi"] = PNG_DPI
+
+        fig.savefig(out_path, **save_kwargs)
+        saved_paths.append(out_path)
+        print(f"Saved figure to: {out_path}")
+
+    plt.close(fig)
+
+    return saved_paths
+
+
+# ============================================================
+# 5. Main
+# ============================================================
 
 def main() -> None:
-    out_dir = os.path.join(".", "results", "vis_results")
-
-    for dataset_name, data in ALL_DATA.items():
-        if not data:
-            continue
-
-        out_path = plot_dataset(dataset_name, data, out_dir)
-        print(f"Saved figure to: {out_path}")
+    plot_tripanel_oa()
 
 
 if __name__ == "__main__":
     main()
-
-

@@ -99,7 +99,7 @@ def prepare_dataset(args, samples_type='ratio'):
         input_normalize[:, :, i] = (input[:, :, i] - input_min) / (input_max - input_min)
 
     # === 这里开始：根据模型类型决定是否做 PCA ===
-    enable_pca_models = {'HybridSN', 'GraphMamba', 'SSFTT'}
+    enable_pca_models = {'HybridSN', 'GraphMamba', 'SSFTT', '3DSS_Mamba'}
     if getattr(args, "model_name", None) in enable_pca_models:
         # 1) 在整幅图像上做 PCA（严格按原 HybridSN 流程）
         H, W, C = input_normalize.shape
@@ -114,6 +114,9 @@ def prepare_dataset(args, samples_type='ratio'):
         elif args.model_name == 'SSFTT':
             n_components = 30
             whiten = False
+        elif args.model_name == '3DSS_Mamba':
+            n_components = 30
+            whiten = True
         else:
             raise ValueError(f"Unexpected PCA model_name: {args.model_name}")
 

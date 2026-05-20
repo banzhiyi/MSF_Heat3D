@@ -31,9 +31,10 @@ from VisionMamba.VMamba import VisionMambaClassifier
 from fvcore.nn import FlopCountAnalysis
 from S2Mamba import S2Mamba
 from vHeat import S2VHeat
-from Mamba_3DSS.model_adapter import Mamba3DSSClassifier
 from SpectralMamba import SpectralMambaPatch
 from GraphMamba.GraphMamba import GraphMambaClassifier
+from ffdb_model import FFDBNet
+from Mamba3DSS import Mamba3DSSClassifier
 # 参数配置
 parser = argparse.ArgumentParser("HSI")
 parser.add_argument('--fix_random', action='store_true', default=True, help='fix randomness')
@@ -41,7 +42,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', '3DSS_Mamba', 'VMamba', 'S2Mamba', 'SpectralMamba', 'GraphMamba'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'VMamba', 'S2Mamba', 'SpectralMamba', 'GraphMamba', 'FFDBNet', '3DSS_Mamba'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -51,6 +52,23 @@ parser.add_argument('--gamma', type=float, default=0.9, help='gamma')
 parser.add_argument('--weight_decay', type=float, default=0, help='weight_decay')
 parser.add_argument('--train_ratio', type=float, default=1.0, help='subsample ratio of predefined training set TR, e.g. 0.2/0.4/0.6/0.8/1.0')
 args = parser.parse_args()
+
+def sync_cuda_if_needed(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def synced_time(device):
+    sync_cuda_if_needed(device)
+    return time.perf_counter()
+
+
+def load_state_dict_safely(weight_path, device):
+    try:
+        return torch.load(weight_path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(weight_path, map_location=device)
+
 
 def estimate_macs_robust(model, dummy_input, model_name: str):
     """
@@ -69,6 +87,8 @@ def estimate_macs_robust(model, dummy_input, model_name: str):
             from fvcore.nn import FlopCountAnalysis
             with torch.no_grad():
                 flops_analyzer = FlopCountAnalysis(model, (dummy_input,))
+                flops_analyzer.unsupported_ops_warnings(False)
+                flops_analyzer.uncalled_modules_warnings(False)
                 flops = float(flops_analyzer.total())
             return flops
         except Exception as e:
@@ -393,7 +413,7 @@ def main():
     if args.model_name == 's2vnet':
         model = S2VNet(band, num_classes, args.patches)
     elif args.model_name == 'MSF_Heat3D':
-        model = MSF_Heat3D(band, num_classes, args.patches, dataset_name=args.dataset,)
+        model = MSF_Heat3D(band, num_classes, args.patches, dataset_name=args.dataset,use_fbm=True,use_afbf=True,)
     elif args.model_name == 'HybridSN':
         # 与其他模型相同的接口: (band, num_classes, patches)
         model = HybridSN(band, num_classes, args.patches)
@@ -433,21 +453,6 @@ def main():
             if_cls_token=True,
             use_middle_cls_token=True,
         )
-    elif args.model_name == "3DSS_Mamba":
-        model = Mamba3DSSClassifier(
-            band=band,
-            num_classes=num_classes,
-            patch_size=args.patches,
-            depth=1,
-            embed_dim=32,
-            d_state=16,
-            group_type="Cube",
-            scan_type="Parallel spectral-spatial",
-            k_group=4,
-            conv3D_channel=32,
-            conv3D_kernel=(3, 5, 5),
-            drop_path_rate=0.1,
-        )
     elif args.model_name == "SpectralMamba":
         model = SpectralMambaPatch(
             bands=band,
@@ -470,6 +475,25 @@ def main():
             residual_in_fp32=True,  # 新增：FP32残差
             fused_add_norm=True,  # 新增：融合操作
         )
+    elif args.model_name == "3DSS_Mamba":
+        model = Mamba3DSSClassifier(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            depth=1,
+            embed_dim=32,
+            d_state=16,
+            scan_type="Parallel spectral-spatial",
+            conv3D_channel=32,
+            conv3D_kernel=(3, 5, 5),
+            drop_path_rate=0.1,
+        )
+    elif args.model_name == "FFDBNet":
+        model = FFDBNet(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+        )
     elif args.model_name == "S2Mamba":
         model = S2Mamba(
             patch=args.patches,  # patch 尺寸
@@ -491,7 +515,7 @@ def main():
             img_size=args.patches,
             vit_patch_size=1,   # 若想划分更多 patch，可改为 2, 3 等，需保证能整除 img_size
             embed_dim=192,
-            depth=6,
+            depth=7,            # 在当前 spectral-spatial token 版本上轻微加深一层
             num_heads=3,
         )
     elif args.model_name == 'MorphFormer':
@@ -558,22 +582,21 @@ def main():
         weight_decay=args.weight_decay  # 建议运行时传 --weight_decay 5e-3 或把默认值改成 5e-3
     )
     """
-
-
+    
+    
 
     # 🆕 修改：只有 s2vnet 需要应用 NonZeroClipper
     if args.model_name == 's2vnet':
         apply_nonegative = NonZeroClipper()
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.epoches // 10, gamma=args.gamma)
+    scheduler_step_size = max(1, args.epoches // 10)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step_size, gamma=args.gamma)
     """
     scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer,
         gamma=args.gamma  # 建议运行时传 --gamma 0.99 或把默认值改成 0.99
     )
     """
-
-
-
+      
 
     # 🆕 初始化训练日志
     log_path = init_training_log(experiment_dir)
@@ -582,7 +605,7 @@ def main():
     if args.flag_test == 'test':
         print("🚀 Start testing...")
         model.eval()
-        ts_start = time.time()
+        ts_start = synced_time(device)
 
         # ✅ 自动选择模型权重路径（根据当前数据集）
         branch_name = get_git_branch_name()
@@ -598,7 +621,7 @@ def main():
             # 若找不到best模型，可改成你之前保存的具体文件名
             weight_path = 'results/vheat3d-未优化/Berlin/Berlin_Heat3D_Pipeline_p5_72.15_epoch460_2025-11-22-1904.pkl'
         print(f"Loading weights from: {weight_path}")
-        model.load_state_dict(torch.load(weight_path, map_location=device))
+        model.load_state_dict(load_state_dict_safely(weight_path, device))
 
         # ✅ 更新：检查新的内存映射文件路径
         large_file_path = f'./results/memmap/{args.dataset}_true.npy'
@@ -617,6 +640,7 @@ def main():
             inference_batch_size = min(128, total_samples)
 
             # 分批推理
+            inference_start = synced_time(device)
             for start_idx in range(0, total_samples, inference_batch_size):
                 end_idx = min(start_idx + inference_batch_size, total_samples)
                 batch_num = (start_idx // inference_batch_size) + 1
@@ -640,6 +664,7 @@ def main():
 
                     preds = torch.argmax(batch_pred, dim=1).cpu().numpy()
                 preds_all.append(preds)
+            inference_end = synced_time(device)
 
             pre_u = np.concatenate(preds_all, axis=0)
             print(f"✅ 分块推理完成，共得到 {len(pre_u)} 个预测结果。")
@@ -652,7 +677,10 @@ def main():
         else:
             print("✅ 未检测到内存映射文件，使用 DataLoader 直接推理...")
             with torch.no_grad():
+                inference_start = synced_time(device)
                 pre_u, tar_t = test_epoch(model, label_true_loader, device)
+                inference_end = synced_time(device)
+        inference_time = inference_end - inference_start
 
         # ✅ 构造预测矩阵并保存
         prediction_matrix = np.zeros((height, width), dtype=float)
@@ -696,13 +724,14 @@ def main():
             json.dump(metrics, f, indent=4)
 
         print(f"📊 测试指标已保存为 JSON 文件：{results_json_path}")
-        ts_end = time.time()
+        ts_end = synced_time(device)
         ts_time = ts_end - ts_start
+        print("TS Time (inference): {:.4f} s".format(inference_time))
         print("TS Time (total test): {:.4f} s".format(ts_time))
 
     else:
         print("start training")
-        tic = time.time()
+        tic = synced_time(device)
         min_val_obj, best_OA = 0.3, 0
         best_epoch = 0
         best_AA = 0
@@ -757,7 +786,7 @@ def main():
             # 🆕 记录训练日志（每个epoch都记录）
             log_training_epoch(log_path, epoch, train_obj, train_acc, val_OA, val_AA, val_Kappa, current_lr)
 
-        toc = time.time()
+        toc = synced_time(device)
         training_time = toc - tic
         print("Running Time: {:.2f}".format(training_time))
         print("**************************************************")

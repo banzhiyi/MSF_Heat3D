@@ -103,6 +103,7 @@ def build_false_color(hsi: np.ndarray, bands=(30, 20, 10)):
     return np.clip((rgb - rgb_min) / denom, 0.0, 1.0)
 
 #其余数据集使用这个build_false_color函数效果更好
+
 """
 def build_false_color(hsi: np.ndarray, bands=(30, 20, 10), p_low: float = 2.0, p_high: float = 98.0):
     b0, b1, b2 = [min(idx, hsi.shape[2] - 1) for idx in bands]
@@ -203,7 +204,7 @@ def save_image(fig_data: np.ndarray, title: str, out_path: str, cmap=None, norm=
     plt.axis("off")
     if show_title and title:
         plt.title(title)
-    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.savefig(out_path, dpi=300, bbox_inches="tight", pad_inches=0)
     plt.close()
 
 
@@ -212,7 +213,8 @@ def main():
     parser.add_argument("--data_path", default="./data/IndianPine.mat")
     parser.add_argument("--dataset_name", default=None)
     parser.add_argument("--output_dir", default="./results/vis_results")
-    parser.add_argument("--false_color_bands", nargs=3, type=int, default=(30, 20, 10))
+    parser.add_argument("--false_color_bands", nargs=3, type=int, default=(28, 18, 8))
+    #indian数据集使用(28, 18, 10)，(28, 18, 8)效果还可以，Augsburg数据集使用(25,15,8),Houston2013数据集使用(30, 20, 10)
     args = parser.parse_args()
 
     dataset_key = infer_dataset_key(args.data_path, args.dataset_name)
