@@ -33,6 +33,7 @@ from S2Mamba import S2Mamba
 from vHeat import S2VHeat
 from SpectralMamba import SpectralMambaPatch
 from GraphMamba.GraphMamba import GraphMambaClassifier
+from GraphMamba.original_graphmamba import OriginalGraphMambaClassifier
 from ffdb_model import FFDBNet
 from Mamba3DSS import Mamba3DSSClassifier
 # 参数配置
@@ -42,7 +43,7 @@ parser.add_argument('--gpu_id', default='0', help='gpu id')
 parser.add_argument('--seed', type=int, default=0, help='number of seed')
 parser.add_argument('--dataset', choices=['Indian', 'Pavia', 'Berlin', 'Augsburg', 'Houston'], default='Indian', help='dataset to use')
 parser.add_argument('--flag_test', choices=['test', 'train'], default='train', help='testing mark')
-parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'VMamba', 'S2Mamba', 'SpectralMamba', 'GraphMamba', 'FFDBNet', '3DSS_Mamba'], default='s2vnet', help='S2VNet')
+parser.add_argument('--model_name', choices=['s2vnet','vHeat', 'MSF_Heat3D','HybridSN','ViT','MorphFormer','SSFTT','HSI3DCNN','DSNet','MASSFormer','SiT', 'HSI2DCNN', 'VMamba', 'S2Mamba', 'SpectralMamba', 'GraphMamba', 'GraphMambaOriginal', 'FFDBNet', '3DSS_Mamba'], default='s2vnet', help='S2VNet')
 parser.add_argument('--batch_size', type=int, default=64, help='number of batch size')
 parser.add_argument('--test_freq', type=int, default=5, help='number of evaluation')
 parser.add_argument('--patches', type=int, default=7, help='number of patches')
@@ -474,6 +475,22 @@ def main():
             rms_norm=True,  # 新增：使用RMSNorm
             residual_in_fp32=True,  # 新增：FP32残差
             fused_add_norm=True,  # 新增：融合操作
+        )
+    elif args.model_name == "GraphMambaOriginal":
+        model = OriginalGraphMambaClassifier(
+            band=band,
+            num_classes=num_classes,
+            patch_size=args.patches,
+            depth=6,
+            embed_dim=64,
+            gcn_layers=3,
+            rms_norm=True,
+            residual_in_fp32=True,
+            fused_add_norm=True,
+            if_abs_pos_embed=True,
+            if_rope=False,
+            if_rope_residual=True,
+            bimamba_type="v2",
         )
     elif args.model_name == "3DSS_Mamba":
         model = Mamba3DSSClassifier(
